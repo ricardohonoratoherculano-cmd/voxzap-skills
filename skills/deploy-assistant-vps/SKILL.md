@@ -31,18 +31,26 @@ This skill documents the architecture, patterns, and conventions for building a 
 2. **Install Docker** — Docker Engine + Docker Compose (if not installed)
 3. **Generate Files** — Dockerfile, docker-compose.yml, nginx.conf, .env (sent to VPS via SFTP)
 4. **Upload Source** — Tar + upload project source code to VPS
-5. **Build & Deploy** — `nohup bash deploy.sh &` (background build + `drizzle-kit push` + app restart)
+5. **Build & Deploy (Nova Instalação)** — `nohup bash deploy.sh &` (background build + `prisma db push --force-reset` = **RESETA O BANCO**, recria schema vazio, seed cria apenas SuperAdmin)
 6. **Verify Status** — Check container health + build logs
 7. **Certificado SSL** — Let's Encrypt HTTPS certificate via certbot (requires containers running)
 8. **TURN Server (Chamadas)** — Install coturn on VPS host for WebRTC NAT traversal (WhatsApp voice calls)
 
-### Update Flow (Code Changes Only)
+### Update Flow (Code Changes Only) — "Atualizar VoxZap"
 When only application code changed (no infrastructure/config changes):
-- Run only **Step 4** (Upload) + **Step 5** (Build & Deploy)
+- Use the **"Atualizar VoxZap"** quick update button (NOT the full deploy steps)
+- This runs `update.sh` which does: build → `prisma db push` (schema sync, **NO data loss**) → restart
+- Route: `POST /api/admin/ssh/deploy/update-and-start` (uploads `update.sh` via SFTP, then runs it)
 - Steps 1-3, 6-8 are NOT needed for simple code updates
 
 ### Full Deploy (First Time or Infrastructure Changes)
-Run all 8 steps in order. Step 8 (coturn) is now integrated into the guided deploy UI.
+Run all 8 steps in order. Step 5 **RESETS THE DATABASE** — only the default SuperAdmin user will exist after deploy. Step 8 (coturn) is now integrated into the guided deploy UI.
+
+### CRITICAL: Two Deploy Scripts
+| Script | Used By | Database Action |
+|--------|---------|-----------------|
+| `deploy.sh` | Step 5 (Nova Instalação) | `prisma db push --force-reset` — DROPS ALL DATA, recreates schema, seed creates SuperAdmin only |
+| `update.sh` | "Atualizar VoxZap" button | `prisma db push` (no reset) — syncs schema changes, preserves all data |
 
 ### Step 8 — TURN Server (Chamadas) — Implementation Details
 - **Route:** `POST /api/admin/ssh/deploy/install-coturn`
@@ -711,6 +719,7 @@ Separate card below the steps with: Status, Logs, Ver Logs do Build, Reiniciar, 
 - **Role model**: `superadmin` role required for all deploy endpoints
 - **Certbot auto-install**: checks `which certbot` before attempting install
 - **NEVER hardcode SSH credentials** in scripts — always pass via UI form or environment variables
+- **DATABASE_URL is REQUIRED**: The `generate-files` step validates that `databaseUrl` is non-empty and starts with `postgresql://`. No placeholder fallback — deploy fails fast if missing. If the password contains special characters (`/`, `=`, `@`, `#`), they MUST be URL-encoded in the connection string (e.g., `/` → `%2F`, `=` → `%3D`, `@` → `%40`). The frontend shows this hint to the user.
 - **Passwords with `$` characters**: `$` is escaped as `$$` in `.env` values via `escapeEnvDollar()` helper. Values are NOT single-quoted. Docker Compose interprets `$$` as literal `$`. Files uploaded via SFTP (NOT shell echo, which expands `$`)
 - **TURN credentials**: Stored in `sip-webrtc-config.json` (server-side only, returned via authenticated API)
 
