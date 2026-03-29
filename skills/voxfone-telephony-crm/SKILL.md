@@ -100,6 +100,10 @@ SuperAdmin configures which menu items each role can see via `/menu-permissions`
 
 Key files: `client/src/pages/menu-permissions.tsx`, `client/src/components/sidebar.tsx`, `client/src/pages/home.tsx`, `server/routes.ts`
 
+**IMPORTANT — Keeping permissions in sync**: Whenever a new page or sidebar entry is added to the system, it MUST also be added to the `allMenuItems` array in `client/src/pages/menu-permissions.tsx` in the corresponding section (Painel Principal, Relatórios, Supervisor, Discador, PBXIP, Administrador). The sections in this array must mirror the sidebar sections in `sidebar.tsx`. Failing to add new items here means SuperAdmin cannot control access to those pages.
+
+**Sidebar section auto-hide**: The sidebar (`sidebar.tsx`) checks `hasVisibleItems` before rendering each section. If no items in a section are permitted for the current user's role, the section title and separator are hidden entirely. This applies to all sections including Discador, PBXIP, etc.
+
 ### SuperAdmin Seeding
 The SuperAdmin user is created/updated automatically on every server start via `seedSuperAdmin()` in `server/seed.ts`. Credentials come from environment variables:
 - `SUPERADMIN_PASSWORD` (secret, required) — if not set, superadmin creation is skipped
@@ -126,6 +130,40 @@ After login, users land on `/` (Home page) instead of Dashboard. Shows all menu 
 Key file: `client/src/pages/home.tsx`
 
 ## CDR Reports Pattern
+
+### CRITICAL: Timestamp Formatting Rule (TO_CHAR — No JavaScript Date)
+**NEVER** pass raw `eventdate` or `calldate` from PostgreSQL to the frontend. The `pg` Node.js driver interprets `timestamp without timezone` as UTC, causing a **3-hour shift** for Brazil (UTC-3) data.
+
+**ALWAYS** use `TO_CHAR()` in SQL to format timestamps directly in PostgreSQL:
+```sql
+-- For display columns:
+TO_CHAR(ql.eventdate, 'DD/MM/YYYY HH24:MI:SS') AS data_hora_fmt
+TO_CHAR(cdr.calldate, 'DD/MM/YYYY HH24:MI:SS') AS calldate_fmt
+TO_CHAR(eventdate, 'HH24:MI:SS') AS hora
+TO_CHAR(eventdate::date, 'DD/MM/YYYY') AS dia
+
+-- For date range filtering (direct comparison, NO EPOCH):
+WHERE ql.eventdate BETWEEN '20260302' AND '20260302 235959'
+-- NEVER: WHERE EXTRACT(EPOCH FROM ql.eventdate) BETWEEN ...
+```
+
+**Backend mapping**: Use the pre-formatted string directly:
+```typescript
+// CORRECT:
+dataHora: row.data_hora_fmt || ''
+calldate: row.calldate_fmt || row.calldate
+
+// WRONG — causes timezone shift:
+dataHora: this.formatDateTime(row.eventdate)
+dataHora: new Date(row.eventdate).toLocaleString()
+```
+
+**Frontend guards**: If receiving a pre-formatted `DD/MM/YYYY` string, detect it and skip re-parsing:
+```typescript
+if (/^\d{2}\/\d{2}\/\d{4}/.test(dateStr)) return dateStr;
+```
+
+**Applies to ALL reports**: attended calls, abandoned calls, CDR viewer, queue_log viewer, retorno pendentes, Report Assistant templates, and AI-generated custom queries.
 
 ### Report Filter Convention
 All report pages follow this filter pattern:
@@ -537,6 +575,152 @@ All UI labels in Portuguese (pt-BR). Maintain this convention for any new featur
 - **IMPORTANTE**: Para ChanSpy via ARI, usar `context`+`extension` no Originate, NUNCA `app` (Stasis faz o canal cair)
 - **Helpers reutilizáveis**: `loadAriConfig()`, `ariRequest()`, `findChannelByRamal()` em `server/routes.ts`
 
+## Dashboard — Visual Pattern (MANDATORY for ALL Dashboard Pages)
+
+All dashboard and monitoring pages (Dashboard Principal, Discador, Filas, etc.) MUST follow this exact visual pattern for consistency. This is the authoritative reference — never invent custom layouts.
+
+### Page Structure
+```tsx
+<div className="flex flex-col h-full">
+  <header className="bg-card border-b border-border px-6 py-4">
+    {/* Title row + filter controls + action buttons */}
+  </header>
+  <main className="flex-1 overflow-auto p-6">
+    {/* Content: KPI cards, operator cards, charts, tables */}
+  </main>
+</div>
+```
+
+### Header Bar
+- Background: `bg-card border-b border-border px-6 py-4`
+- Left side: Icon + title (`text-xl font-semibold`)
+- Right side: Filter controls (Select/Dropdown with Filter icon), live indicator badge, Refresh button (`RefreshCw` icon)
+- Live indicator: `<Badge variant="outline">` with pulsing green dot (`animate-pulse`) + "Ao vivo: Xs"
+- Refresh button: `<Button variant="outline" size="sm">` with `RefreshCw` icon, shows `animate-spin` while loading
+
+### KPI Cards (Metrics)
+```tsx
+<div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+  <Card>
+    <CardContent className="p-4">
+      <div className="flex items-center gap-2 mb-2">
+        <Icon className="h-4 w-4 text-muted-foreground" />
+        <span className="text-sm text-muted-foreground">{label}</span>
+      </div>
+      <div className="text-3xl font-bold">{value}</div>
+      <p className="text-xs text-muted-foreground mt-1">{subtitle}</p>
+    </CardContent>
+  </Card>
+</div>
+```
+- Number size: `text-3xl font-bold` (ALWAYS — never smaller for primary metrics)
+- Icon + label on top row: `h-4 w-4 text-muted-foreground` + `text-sm text-muted-foreground`
+- Descriptive subtitle below: `text-xs text-muted-foreground mt-1`
+- Grid: `grid-cols-2 md:grid-cols-4` (4 columns on desktop, 2 on mobile)
+- For progress bars (SLA, Taxa de Contato): colored bar below the number using `bg-gradient-to-r` or inline width
+
+### Operator Status Cards (Summary Row)
+```tsx
+<Card className="border-l-4 border-l-{color}-500/30">
+  <CardContent className="p-3 flex items-center gap-3">
+    <div className="w-9 h-9 rounded-lg bg-{color}-500/15 flex items-center justify-center">
+      <Icon className="h-5 w-5 text-{color}-500" />
+    </div>
+    <div>
+      <div className="text-2xl font-bold">{count}</div>
+      <div className="text-xs text-muted-foreground">{label}</div>
+    </div>
+  </CardContent>
+</Card>
+```
+- Left colored border: `border-l-4 border-l-{color}-500/30`
+- Icon in colored circle: `w-9 h-9 rounded-lg bg-{color}-500/15` with icon `text-{color}-500`
+- Colors by status: blue=Logados, green=Livres, red=Ocupados, orange=Chamando, yellow=Pausa, purple=Espera
+- Grid: `grid-cols-3 md:grid-cols-6`
+
+### Tables
+```tsx
+<div className="border border-border rounded-lg overflow-hidden">
+  <table className="w-full text-sm">
+    <thead>
+      <tr className="bg-muted/50">
+        <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">
+          {header}
+        </th>
+      </tr>
+    </thead>
+    <tbody className="divide-y divide-border">
+      <tr className="hover:bg-muted/30 transition-colors">
+        <td className="px-3 py-2">{value}</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+```
+- Header: `bg-muted/50`, text `uppercase tracking-wider text-xs font-medium text-muted-foreground`
+- Body: `divide-y divide-border`, rows with `hover:bg-muted/30 transition-colors`
+- Container: `border border-border rounded-lg overflow-hidden`
+- Optional header badge count: `<Badge variant="secondary" className="text-xs">{count}</Badge>`
+
+### Custom Bar Charts (Horizontal)
+Instead of recharts, use CSS-based horizontal bars for simple distribution charts:
+```tsx
+<div className="space-y-2">
+  {data.map(item => (
+    <div key={item.label} className="flex items-center gap-2">
+      <span className="text-xs text-muted-foreground w-12">{item.label}</span>
+      <div className="flex-1 bg-muted/30 rounded-full h-5 overflow-hidden">
+        <div
+          className="h-full bg-primary/70 rounded-full"
+          style={{ width: `${percentage}%` }}
+        />
+      </div>
+      <span className="text-xs font-medium w-8 text-right">{item.value}</span>
+    </div>
+  ))}
+</div>
+```
+
+### Loading State
+```tsx
+<main className="flex-1 flex items-center justify-center">
+  <div className="text-center">
+    <RefreshCw className="h-8 w-8 animate-spin text-primary mx-auto mb-2" />
+    <p className="text-muted-foreground">Carregando dados...</p>
+  </div>
+</main>
+```
+
+### Error State
+```tsx
+<main className="flex-1 flex items-center justify-center">
+  <Card className="max-w-md">
+    <CardContent className="p-6 text-center">
+      <AlertTriangle className="h-8 w-8 text-destructive mx-auto mb-2" />
+      <p className="text-destructive font-medium">Erro ao carregar dados</p>
+      <Button variant="outline" size="sm" onClick={refetch} className="mt-3">
+        Tentar Novamente
+      </Button>
+    </CardContent>
+  </Card>
+</main>
+```
+
+### FormField Tooltips (for Management Pages)
+Management/config pages use `TooltipProvider` (delayDuration=200) with `HelpCircle` icon for field descriptions:
+```tsx
+<TooltipProvider delayDuration={200}>
+  <Tooltip>
+    <TooltipTrigger asChild>
+      <HelpCircle className="h-[13px] w-[13px] text-muted-foreground hover:text-blue-400 cursor-help" />
+    </TooltipTrigger>
+    <TooltipContent side="top" className="max-w-xs">
+      <p className="text-xs">{description}</p>
+    </TooltipContent>
+  </Tooltip>
+</TooltipProvider>
+```
+
 ## Dashboard — Features
 
 ### Section Visibility Toggles
@@ -734,6 +918,66 @@ exten => h,3,Set(OPERADOR_DATAHORA()=${MEMBERNAME})
 - `QUEUELOG_SAIU()` — marks queue_log data5='SAIU' (hangup tracking)
 - `VOXCALLLOG_DELETE()` — cleans voxcalllog table
 - `OPERADOR_DATAHORA()` — updates operator timestamp
+
+### Discador Preditivo (Implementado — 2026-03)
+
+**Páginas do frontend** (seção DISCADOR na sidebar, visível para administrator/superadmin):
+- `/dialer-dashboard` — Dashboard com status do engine, estatísticas em tempo real
+- `/dialer-campaigns` — Gerenciamento de campanhas (CRUD, fila vinculada, horários, retry rules)
+- `/dialer-mailing` — Listas de discagem (upload CSV, status de registros, DNC)
+- `/dialer-reports` — Relatórios do discador (abas: Resumo, Tentativas, Operadores)
+
+**Arquivos principais**:
+- `server/dialer-engine.ts` (~1400 linhas) — Motor de discagem com AMI Originate
+- `client/src/pages/dialer-dashboard.tsx` — Dashboard do discador
+- `client/src/pages/dialer-campaigns.tsx` — Campanhas
+- `client/src/pages/dialer-mailing.tsx` — Listas de discagem
+- `client/src/pages/dialer-reports.tsx` — Relatórios do discador
+
+**Tabelas no banco LOCAL (Replit PostgreSQL)** — definidas em `shared/schema.ts`:
+- `dialer_campaigns` — campanhas (nome, fila, horários, max_concurrent, retry rules)
+- `dialer_mailing` — registros de discagem (phone, status, attempts, campaignId)
+- `dialer_call_log` — log de cada tentativa (duration, disposition, channel)
+- `dialer_stats_hourly` — estatísticas agregadas por hora
+- `dialer_dnc` — lista Do Not Call (phone, reason, campaignId)
+
+**Tabelas no banco VPS (PostgreSQL externo)** — definidas em `server/asterisk-schema.sql`:
+- `dialer_queue_log` — eventos de fila filtrados do discador (populada via trigger `trg_dialer_queue_log` no `queue_log`)
+- `dialer_agent_performance` — métricas agregadas por operador/campanha/dia (populada via trigger `trg_dialer_agent_performance` no `dialer_queue_log`)
+
+**Cascade de Triggers do Discador no VPS**:
+1. `queue_log` → `trg_dialer_queue_log` → `dialer_queue_log` (filtra fila `voxdial`, correlaciona CDR userfield → campaign_id)
+2. `dialer_queue_log` → `trg_dialer_agent_performance` → `dialer_agent_performance` (UPSERT agent/campaign_id/stat_date; CONNECT/COMPLETEAGENT/COMPLETECALLER/RINGNOANSWER)
+
+**Integração com VPS**:
+- Chamadas originadas via AMI → geram eventos queue_log (ENTERQUEUE, CONNECT, COMPLETE) → triggers VPS preenchem `t_monitor_voxcall` + `dialer_queue_log` + `dialer_agent_performance` automaticamente
+- `monitor_operador` consultado para verificar disponibilidade de operadores
+- Relatório de Operadores do Discador usa `dialer_agent_performance` (primário) ou `dialer_queue_log` (fallback) — NÃO usa AMI
+- O campo `canal` em `t_monitor_voxcall` fica vazio para chamadas do discador enquanto o CEL não estiver ativado no Asterisk
+
+**API endpoints** (role: administrator/superadmin):
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/dialer/engine/status` | Status do engine (running, stats) |
+| POST | `/api/dialer/engine/start` | Iniciar engine |
+| POST | `/api/dialer/engine/stop` | Parar engine |
+| GET | `/api/dialer/queues` | Listar filas Asterisk |
+| GET | `/api/dialer/triggers-status` | Status das triggers do discador |
+| GET | `/api/dialer/dnc` | Listar DNC |
+| POST | `/api/dialer/dnc` | Adicionar DNC |
+| DELETE | `/api/dialer/dnc/:id` | Remover DNC |
+| GET | `/api/dialer/reports/agent-performance` | Relatório de operadores (startDate, endDate, campaignId) |
+| GET | `/api/dialer/reports/summary` | Resumo geral do discador |
+| GET | `/api/dialer/reports/attempts` | Relatório de tentativas |
+
+**Bugs corrigidos (2026-03-26/27)**:
+- `isRecordRetryReady()`: bloqueava registros com attempts=0 e lastAttemptAt preenchido — corrigido para só verificar intervalo quando attempts > 0
+- Timezone: usar `Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' })` para comparações de data
+- Registros órfãos: `recoverStaleDialingRecords()` no startup reseta registros travados em `dialing`
+- UNIQUE index faltando em `relatorio_operador(data, operador, fila)` na VPS — causava ROLLBACK de toda a cascade de triggers
+- Relatório de Operadores: removida captura AMI (operatorRamal/operatorName), substituída por trigger PostgreSQL `trg_dialer_agent_performance`
+
+**CEL pendente**: O campo `canal` de `t_monitor_voxcall` depende da tabela `canal_chamada`, preenchida pela trigger `fn_cel_captura_canal` no CEL. O CEL está desativado no Asterisk (ver asterisk-callcenter-expert skill para detalhes de ativação).
 
 ### Report UI Conventions
 - Headers: `bg-blue-700` (group row), `bg-blue-600` (column row), white text
@@ -1706,14 +1950,14 @@ Uses `--network host` instead of Docker port mapping because:
 
 ---
 
-## VoxGuard — Security Agent (v1.2)
+## VoxGuard — Multi-Source Security Agent (v2.0)
 
-Custom Fail2Ban-like security agent for Asterisk VPS. Monitors logs in real-time, blocks attacker IPs via nftables sets with auto-expiry, sends email alerts via SMTP. Supports both **Docker** and **native** Asterisk installations with auto-detection.
+Custom Fail2Ban-like security agent for VPS. Monitors multiple log sources in real-time, blocks attacker IPs via nftables sets with auto-expiry, sends email alerts via SMTP. Supports both **Docker** and **native** Asterisk installations with auto-detection. **Only blocks external (public) IPs** — all private/internal ranges are whitelisted by default.
 
 ### Architecture
 - **Python script** (`/opt/voxguard/voxguard.py`) running as systemd service on VPS **host** (NOT inside Docker)
 - **nftables named sets** with `flags timeout` — kernel handles auto-expiry, O(1) lookup, handles 100K+ IPs
-- **3 monitoring threads**: Asterisk logs (Docker or native), SSH auth logs (`auth.log` or `journalctl`), maintenance loop (stats save, system monitoring, daily report)
+- **Up to 6 monitoring threads** (configurable via `log_sources`): Asterisk logs, SSH auth logs, PostgreSQL logs, Nginx logs, Docker daemon logs, maintenance loop
 - **Dual mode**: Auto-detects Docker vs native Asterisk on startup
 - **Stats persistence**: `/var/lib/voxguard/stats.json` saved every 60s
 - **Logging**: `/var/log/voxguard.log` with 5MB rotation (3 backups)
@@ -1722,19 +1966,69 @@ Custom Fail2Ban-like security agent for Asterisk VPS. Monitors logs in real-time
 ### Source Files
 | File | Description |
 |------|-------------|
-| `modelo_asterisk/voxguard/voxguard.py` | Main Python agent script |
-| `modelo_asterisk/voxguard/voxguard.conf` | JSON configuration (whitelist, thresholds, SMTP, monitoring) |
+| `modelo_asterisk/voxguard/voxguard.py` | Main Python agent script (v2.0) |
+| `modelo_asterisk/voxguard/voxguard.conf` | JSON configuration (whitelist, thresholds, SMTP, monitoring, log_sources) |
 | `modelo_asterisk/voxguard/voxguard.service` | systemd unit file |
 | `modelo_asterisk/asterisk/logger.conf` | Asterisk security logging (security => security) |
 
-### Attack Patterns Detected
+### Configurable Log Sources (`log_sources` config key)
+Each source can be toggled on/off independently. Disabled sources do not start monitoring threads (zero resource usage).
+
+| Source Key | What it Monitors | Default |
+|------------|-----------------|---------|
+| `asterisk` | SIP probes, auth failures, SIP scanners (sipvicious) via Docker logs or native log files | `true` |
+| `linux_ssh` | SSH brute force, invalid users via `/var/log/auth.log` or `journalctl` | `true` |
+| `postgresql` | Auth failures, pg_hba violations, connection rejects — supports Docker containers (multi-container with `selectors` for non-blocking reads) and native log files | `false` |
+| `nginx` | Vulnerability scans (phpMyAdmin, wp-admin, .env, .git, xmlrpc, etc.), web brute force (401 on login endpoints), 4xx status floods | `false` |
+| `docker` | Unauthorized access to Docker daemon API | `false` |
+
+### Attack Patterns Detected (v2.0)
+
+**Asterisk Patterns:**
 | Type | Pattern | Threshold | Ban Duration |
 |------|---------|-----------|-------------|
 | `sip_probe` | "No matching endpoint found" | 5 in 60s | 24h |
 | `auth_fail` | ChallengeResponseFailed / InvalidPassword | 5 in 60s | 24h |
 | `scanner` | sipvicious / friendly-scanner user-agent | Instant | 7 days |
-| `ssh_brute` | "Failed password" / "Invalid user" | 5 in 300s | 24h |
+
+**SSH Patterns:**
+| Type | Pattern | Threshold | Ban Duration |
+|------|---------|-----------|-------------|
+| `ssh_brute` | "Failed password" / "Invalid user" / "authentication failure" | 5 in 300s | 24h |
+
+**PostgreSQL Patterns:**
+| Type | Pattern | Threshold | Ban Duration |
+|------|---------|-----------|-------------|
+| `pg_auth_fail` | "password authentication failed" (host=, client=, [client=], Docker format) | 5 in 300s | 24h |
+| `pg_auth_fail` | "no pg_hba.conf entry" | 5 in 300s | 24h |
+| `pg_auth_fail` | "connection rejected" / "role does not exist" / "database does not exist" | 5 in 300s | 24h |
+
+**Nginx Patterns:**
+| Type | Pattern | Threshold | Ban Duration |
+|------|---------|-----------|-------------|
+| `web_scan` | Request path contains phpMyAdmin, wp-admin, .env, .git/, xmlrpc, cgi-bin, eval(, /passwd, setup.php, .asp, /backup, etc. | 10 in 60s | 24h |
+| `web_scan` | 400/403/404/444 HTTP status codes | 10 in 60s | 24h |
+| `web_brute` | POST to /login, /auth, /signin, /api/auth returning 401 | 10 in 60s | 24h |
+
+**Docker Patterns:**
+| Type | Pattern | Threshold | Ban Duration |
+|------|---------|-----------|-------------|
+| `docker_unauth` | Unauthorized access to Docker daemon API | 3 in 300s | 24h |
+
+**Global:**
+| Type | Pattern | Threshold | Ban Duration |
+|------|---------|-----------|-------------|
 | Repeat offender | Blocked 3+ times | Auto | Permanent |
+
+### Internal IP Protection (Whitelist)
+VoxGuard **never blocks internal/private IPs**. Default whitelist includes:
+- `127.0.0.1` — localhost
+- `10.0.0.0/8` — private class A
+- `172.16.0.0/12` — private class B (**covers all Docker bridge IPs**: `172.18.x.x`, `172.20.x.x`, etc.)
+- `192.168.0.0/16` — private class C
+- Replit IP ranges: `34.0.0.0/8`, `35.0.0.0/8`, `104.0.0.0/8`, `172.96.0.0/11`, `172.110.0.0/16`
+
+The `is_whitelisted()` function checks every IP against these ranges before any blocking action. Container-to-container traffic is always safe.
 
 ### nftables Blocking
 ```bash
@@ -1751,7 +2045,7 @@ nft add element inet voxguard blocked '{ 1.2.3.4 timeout 86400s }'
 nft add element inet voxguard blocked '{ 1.2.3.4 }'
 ```
 
-### Dual Mode Support (v1.2)
+### Dual Mode Support
 VoxGuard auto-detects whether Asterisk runs in Docker or natively on startup:
 
 | Check | Docker Mode | Native Mode |
@@ -1773,11 +2067,22 @@ VoxGuard auto-detects whether Asterisk runs in Docker or natively on startup:
 ```json
 {
   "whitelist": ["127.0.0.1", "172.16.0.0/12", "10.0.0.0/8", "192.168.0.0/16"],
+  "log_sources": {
+    "asterisk": true,
+    "linux_ssh": true,
+    "postgresql": false,
+    "nginx": false,
+    "docker": false
+  },
   "thresholds": {
     "sip_probe": {"count": 5, "window": 60, "ban_duration": 86400},
     "auth_fail": {"count": 5, "window": 60, "ban_duration": 86400},
     "scanner": {"ban_duration": 604800},
     "ssh_brute": {"count": 5, "window": 300, "ban_duration": 86400},
+    "pg_auth_fail": {"count": 5, "window": 300, "ban_duration": 86400},
+    "web_scan": {"count": 10, "window": 60, "ban_duration": 86400},
+    "web_brute": {"count": 10, "window": 60, "ban_duration": 86400},
+    "docker_unauth": {"count": 3, "window": 300, "ban_duration": 86400},
     "repeat_offender": {"count": 3, "ban_duration": 0}
   },
   "smtp": {
@@ -1817,7 +2122,7 @@ VoxGuard is deployed automatically during Asterisk build:
   - **IPs Bloqueados**: Table with IP + timeout + unblock button
   - **Logs**: Terminal-style viewer with color-coded lines, auto-scroll
   - **Whitelist**: Add/remove IPs and CIDRs
-  - **Configuração**: Display current config JSON
+  - **Configuração**: Log source toggles (Switch components for each source), email alerts config, thresholds display, monitoring settings
 - **Actions**: Carregar Status, Reiniciar, Parar, Limpar Bloqueios, Instalar/Atualizar
 
 ### API Endpoints (all `superadmin` only)
@@ -1831,6 +2136,7 @@ VoxGuard is deployed automatically during Asterisk build:
 | POST | `/api/admin/ssh/voxguard/restart` | systemctl restart voxguard |
 | POST | `/api/admin/ssh/voxguard/stop` | systemctl stop voxguard |
 | POST | `/api/admin/ssh/voxguard/whitelist` | Read/add/remove whitelist entries (modifies voxguard.conf) |
+| POST | `/api/admin/ssh/voxguard/config` | Load/save log_sources, email, thresholds, monitoring config |
 | POST | `/api/admin/ssh/voxguard/install` | Upload files + install + enable + start service |
 
 ### Email Alerts
@@ -1848,7 +2154,10 @@ VoxGuard is deployed automatically during Asterisk build:
 5. **After server reboot**: systemd restarts VoxGuard automatically, nftables sets are recreated empty (attackers re-detected quickly)
 6. **Service file has NO Docker dependency** — uses `After=network.target` so it starts on any VPS
 7. **SSH monitoring fallback**: If `/var/log/auth.log` doesn't exist, uses `journalctl -u sshd -u ssh -f`
-8. **Whitelist supports CIDR** — e.g., `10.0.0.0/8` blocks entire range from being banned
+8. **Whitelist supports CIDR** — e.g., `10.0.0.0/8` blocks entire range from being banned; `172.16.0.0/12` covers all Docker bridge IPs
 9. **Config format is JSON** (not YAML) — Python falls back to `json.loads()` if PyYAML not installed
 10. **Stats saved to `/var/lib/voxguard/stats.json`** — survives restarts, loaded on startup
 11. **Install endpoint uses sync fs** — must `await import('fs')` for `existsSync`/`readFileSync` (top-level `fs` is `promises` only)
+12. **No hot-reload**: Config loaded once at startup. After changes (log sources, whitelist, thresholds), `systemctl restart voxguard` required
+13. **PostgreSQL multi-container monitoring**: Uses Python `selectors` module for non-blocking reads across multiple `docker logs -f` processes — avoids stalling when one container is quiet
+14. **Nginx patterns match request path**: Scan detection regex matches suspicious tokens in the URL path (before status code), not after — handles standard access log format correctly

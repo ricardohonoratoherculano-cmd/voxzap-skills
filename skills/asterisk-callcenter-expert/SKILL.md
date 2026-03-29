@@ -29,7 +29,7 @@ Skill para desenvolvimento de relatórios e dashboards de Call Center baseados n
 
 ## Visão Geral das Tabelas
 
-O sistema utiliza **6 tabelas principais** no banco de dados PostgreSQL externo do Asterisk:
+O sistema utiliza **8 tabelas principais** no banco de dados PostgreSQL externo do Asterisk:
 
 | Tabela | Tipo | Descrição |
 |--------|------|-----------|
@@ -39,6 +39,8 @@ O sistema utiliza **6 tabelas principais** no banco de dados PostgreSQL externo 
 | `queue_member_table_tela` | **Customizada VoxCALL** | Membros/agentes das filas (membername, queue_name, interface, penalty, paused) |
 | `monitor_operador` | **Customizada VoxCALL** | Estado em tempo real dos operadores (login, pausa, atendimentos) |
 | `t_monitor_voxcall` | **Customizada VoxCALL** | Registro de cada atendimento com dados enriquecidos |
+| `dialer_queue_log` | **Customizada VoxCALL** | Eventos de fila filtrados do discador (populada via trigger `trg_dialer_queue_log` no `queue_log`) |
+| `dialer_agent_performance` | **Customizada VoxCALL** | Métricas agregadas por operador/campanha/dia (populada via trigger `trg_dialer_agent_performance` no `dialer_queue_log`) |
 
 ### Tabela `cdr` (Call Detail Records)
 
@@ -418,6 +420,28 @@ Use esta tabela para consultas de volume/quantidade (mais leve que queue_log):
 | `abandonadas` | integer | Chamadas abandonadas na hora |
 | `fila` | varchar | Nome da fila |
 
+### Relatório Pivô: Chamadas Atendidas por Hora (`/answered-calls-by-hour`)
+
+Relatório dedicado que mostra chamadas atendidas em formato pivô (Unidade/Mês/Operador em linhas, horas do dia em colunas). Dados da `queue_log` com filtro de tempo de conversa configurável.
+
+- **Fonte**: `queue_log` — eventos `COMPLETEAGENT`/`COMPLETECALLER`, campo `data2` = tempo de conversa
+- **Filtro de tempo**: Operador de comparação selecionável (`>`, `>=`, `=`, `<`, `<=`) + valor em segundos (padrão: `> 10s`)
+- **Agrupamento**: `queuename` (Unidade), `TO_CHAR(eventdate, 'Mon/YY')` (Mês), `agent` (Operador)
+- **Colunas dinâmicas**: Horas (`h8`, `h9`, `h10`...) — apenas horas com dados aparecem
+- **Backend**: `storage.getAnsweredCallsByHourPivot()`, rota `GET /api/reports/answered-by-hour/:startDate/:endDate?queue=&operator=&talkTimeOp=&talkTimeValue=`
+- **Frontend**: `client/src/pages/answered-calls-by-hour.tsx` — tabela pivô com heat map colorido, sticky header/columns, export Excel/PDF/Print
+- **Query base**:
+```sql
+SELECT queuename AS unidade, TO_CHAR(eventdate, 'Mon/YY') AS mes, agent AS operador,
+       EXTRACT(HOUR FROM eventdate)::int AS hora, COUNT(*) AS qtd
+FROM queue_log
+WHERE event IN ('COMPLETEAGENT', 'COMPLETECALLER')
+  AND eventdate::date BETWEEN $startDate AND $endDate
+  AND COALESCE(data2, '0')::int > $talkTimeValue
+  AND agent IS NOT NULL AND agent <> '' AND agent <> 'NONE'
+GROUP BY queuename, TO_CHAR(eventdate, 'YYYY-MM'), TO_CHAR(eventdate, 'Mon/YY'), agent, EXTRACT(HOUR FROM eventdate)::int
+```
+
 ### Tabela `pausas_operador` (Pausas)
 
 Use para **todos** os relatórios e dashboards de pausa (em vez de queue_log PAUSE/UNPAUSE):
@@ -700,7 +724,7 @@ A configuração de `filas_origem` usa um seletor de checkboxes inline (não pop
 1. **Sempre usar cast seguro** com regex `~ '^\d+$'` antes de converter data1/data2/data3/data4
 2. **Filtrar por período** — nunca trazer dados sem filtro de data (performance)
 3. **Indexar colunas** — `eventdate`, `event`, `queuename`, `agent`, `callid` precisam de índice
-4. **Considerar fuso horário** — PostgreSQL do Asterisk está configurado com `timezone = 'America/Sao_Paulo'`. Os containers Asterisk e asterisk-db têm `TZ=America/Sao_Paulo`. O Asterisk Dockerfile inclui `/etc/localtime` apontando para `America/Sao_Paulo` (Asterisk lê `/etc/localtime`, NÃO a variável TZ). Timestamps no CDR e queue_log são `timestamp with time zone` em horário de Brasília (-03:00). O driver `pg` retorna objetos Date em UTC — usar `getUTC*` para exibição correta
+4. **CRÍTICO: Formatar timestamps com TO_CHAR no SQL** — NUNCA retornar `eventdate` ou `calldate` cru para o frontend. O driver `pg` do Node.js interpreta `timestamp without timezone` como UTC, causando deslocamento de 3 horas para dados em horário de Brasília (UTC-3). SEMPRE usar `TO_CHAR(eventdate, 'DD/MM/YYYY HH24:MI:SS') AS data_hora_fmt` no SQL e mapear `row.data_hora_fmt` diretamente no backend. Para filtros de data, usar comparação direta (`WHERE eventdate BETWEEN '20260302' AND '20260302 235959'`), NUNCA `EXTRACT(EPOCH FROM eventdate)`. No frontend, detectar strings já formatadas: `if (/^\d{2}\/\d{2}\/\d{4}/.test(s)) return s;`. PostgreSQL do Asterisk configurado com `timezone = 'America/Sao_Paulo'`. Containers têm `TZ=America/Sao_Paulo` + `/etc/localtime` → `America/Sao_Paulo`
 5. **Formatar durações** — Converter segundos para HH:MM:SS no frontend
 6. **Excluir eventos internos** — Filtrar `RINGNOANSWER` ao calcular taxa de atendimento
 7. **Separar filas** — Cada fila pode ter metas de SLA diferentes
@@ -710,60 +734,83 @@ A configuração de `filas_origem` usa um seletor de checkboxes inline (não pop
 11. **Filtro de busca por operador** — Usar ILIKE com `%nome%` para busca parcial case-insensitive
 12. **SQL em routes.ts** — Queries SQL complexas devem usar concatenação de strings (`+`), NÃO template literals (`${}`) em esbuild/tsx — risco de truncamento silencioso da classe
 
-## Base para Discador Preditivo (Futuro)
+## Discador Preditivo (Implementado — 2026-03)
+
+### Arquitetura do Motor de Discagem
+
+O discador preditivo está **implementado e funcional**. Arquivo principal: `server/dialer-engine.ts` (~1400 linhas).
+
+**Fluxo de originação**:
+1. Engine verifica operadores disponíveis via `monitor_operador` (fl_pausa=0, hora_logoff IS NULL)
+2. Busca registros `pending` na tabela `dialer_mailing` (banco LOCAL Replit PostgreSQL)
+3. Origina chamada via **AMI Originate** com `Context: MANAGER`, canal `Local/PHONE@MANAGER`
+4. AMI Event Listener monitora eventos (OriginateResponse, Newstate, Hangup) via TCP socket
+5. Resultado da chamada atualiza `dialer_mailing.status` e `dialer_call_log`
+
+**Dados armazenados (banco LOCAL — Replit PostgreSQL)**:
+- `dialer_campaigns` — campanhas com fila, horários, configurações
+- `dialer_mailing` — registros de discagem (phone, status, attempts, campaignId)
+- `dialer_call_log` — log detalhado de cada tentativa
+- `dialer_stats_hourly` — estatísticas por hora
+- `dialer_dnc` — lista Do Not Call
+
+**Dados consultados (banco VPS — PostgreSQL externo)**:
+- `monitor_operador` — disponibilidade real-time dos operadores
+- `queue_member_table_tela` — mapeamento operador↔fila
+- `dialer_queue_log` — eventos de fila filtrados do discador (populada via trigger `trg_dialer_queue_log` no `queue_log`)
+- `dialer_agent_performance` — métricas agregadas por operador/campanha/dia (populada via trigger `trg_dialer_agent_performance` no `dialer_queue_log`)
+- `t_monitor_voxcall` — registro de atendimento (preenchido automaticamente pelas triggers existentes)
+
+**Cascade de Triggers do Discador no VPS**:
+1. `queue_log` → trigger `trg_dialer_queue_log` → popula `dialer_queue_log` (filtra apenas eventos da fila `voxdial` e correlaciona com CDR userfield para extrair campaign_id)
+2. `dialer_queue_log` → trigger `trg_dialer_agent_performance` → popula `dialer_agent_performance` (UPSERT por agent/campaign_id/stat_date, processa CONNECT/COMPLETEAGENT/COMPLETECALLER/RINGNOANSWER)
+
+**Tabela `dialer_agent_performance` (métricas)**:
+- `agent` (varchar 80) — nome do agente como registrado no queue_log
+- `ramal` (varchar 20) — ramal normalizado (sem prefixo SIP/PJSIP)
+- `campaign_id` (varchar) — ID da campanha
+- `stat_date` (date) — data da estatística
+- `total_calls` (int) — CONNECT + RINGNOANSWER (tentativas reais)
+- `answered` (int) — apenas CONNECT
+- `completed` (int) — COMPLETEAGENT + COMPLETECALLER
+- `ring_no_answer` (int) — RINGNOANSWER
+- `total_talk_time`, `avg_talk_time`, `max_talk_time` (int, segundos) — de data2 em COMPLETE*
+- `total_wait_time`, `avg_wait_time` (int, segundos) — de data1 em CONNECT
+- UNIQUE constraint: `dialer_agent_perf_unique (agent, campaign_id, stat_date)`
+
+**Relatório de Operadores do Discador** (`/dialer-reports` aba Operadores):
+- Endpoint: `GET /api/dialer/reports/agent-performance?startDate=&endDate=&campaignId=`
+- Fonte primária: tabela `dialer_agent_performance` no VPS
+- Fallback: query raw no `dialer_queue_log` (quando tabela primária está vazia)
+- Ambas conexões via `createCustomDbConnection()` exportada de `server/storage.ts`
+- NÃO usa AMI para capturar operadores — dados vêm exclusivamente do PostgreSQL VPS
+
+**Bugs corrigidos (2026-03-26/27)**:
+- `isRecordRetryReady()` bloqueava registros com `attempts=0` e `lastAttemptAt` preenchido — corrigido para só verificar intervalo quando `attempts > 0`
+- Timezone: usar `Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' })` para comparações de data
+- Registros órfãos em `dialing`: `recoverStaleDialingRecords()` no startup reseta registros travados
+- VPS trigger `fn_atualiza_relatorio_operador`: faltava UNIQUE index em `relatorio_operador(data, operador, fila)` — causava ROLLBACK de toda a cascade de triggers, impedindo gravação do CONNECT
+- Relatório de Operadores: removida captura AMI (operatorRamal/operatorName do InFlightCall), substituída por trigger PostgreSQL `trg_dialer_agent_performance` para dados consistentes
+
+**CEL / canal_chamada (pendente)**:
+- A tabela `cel` existe como UNLOGGED no VPS, com trigger `fn_cel_captura_canal` que captura CHAN_START → `canal_chamada`
+- CEL está **desativado** no Asterisk (`cel.conf` com `enable=yes` comentado)
+- Backend ODBC do CEL (`cel_odbc.conf`) sem configuração ativa
+- O módulo `cel_odbc.so` está carregado no Asterisk mas o CEL core precisa de restart completo para ativar
+- ODBC DSN `asterisk-connector` funciona (localhost:25432, mesmo do CDR)
+- Para ativar: configurar `cel.conf` (enable=yes, events=CHAN_START) e `cel_odbc.conf` (connection=asterisk, table=cel), depois restart do Asterisk
+- O campo `canal` em `t_monitor_voxcall` fica vazio até o CEL ser ativado
 
 ### Dados Disponíveis na `retorno_historico`
 
-A tabela `retorno_historico` já contém toda a base de dados necessária para um discador preditivo:
+A tabela `retorno_historico` contém dados históricos úteis para analytics do discador:
 
 **Métricas extraíveis por consulta**:
 - Taxa de sucesso por fila: `SELECT fila_origem, COUNT(*) FILTER (WHERE status='ATENDIDO') * 100.0 / COUNT(*) FROM retorno_historico GROUP BY fila_origem`
 - Taxa de sucesso por horário: `SELECT EXTRACT(HOUR FROM data_retorno) AS hora, COUNT(*) FILTER (WHERE status='ATENDIDO') * 100.0 / COUNT(*) FROM retorno_historico GROUP BY hora`
 - Taxa de sucesso por tentativa: `SELECT tentativa, COUNT(*) FILTER (WHERE status='ATENDIDO') * 100.0 / COUNT(*) FROM retorno_historico GROUP BY tentativa`
-- Tempo médio até resultado: `SELECT AVG(EXTRACT(EPOCH FROM (data_resultado - data_retorno))) FROM retorno_historico WHERE data_resultado IS NOT NULL`
-- Performance por operador: `SELECT operador, COUNT(*) FILTER (WHERE status='ATENDIDO') * 100.0 / COUNT(*) FROM retorno_historico GROUP BY operador`
 
-**Tabelas envolvidas no discador**:
-1. `retorno_historico` — histórico completo de tentativas com status
-2. `retorno_clientes` — estado atual de cada chamada abandonada
-3. `queue_retorno_config` — configuração de filas, tentativas e intervalos
-4. `monitor_operador` — disponibilidade real-time dos operadores
-5. `queue_member_table_tela` — mapeamento operador↔fila
-
-**Padrões de query para previsão**:
-- Melhor horário para ligar: agrupar `retorno_historico` por hora do dia, calcular taxa ATENDIDO
-- Probabilidade por tentativa: taxa de sucesso cai significativamente após a 2ª tentativa
-- Capacidade do operador: cruzar `monitor_operador.fl_pausa` com contagem de operadores LIVRE para estimar throughput
-
-**AMI Originate**: Já funcional e testado — usar `Context/Exten/Priority` com LOCAL channel (documentado acima)
-
-## Integração VoxCall → WhatsApp (VoxZap)
-
-O sistema VoxZap possui integração com o banco PostgreSQL do VoxCall para monitorar chamadas abandonadas e enviar automaticamente templates WhatsApp para retorno.
-
-### Tabela Monitorada
-- **`retorno_clientes`** — mesma tabela usada internamente pelo VoxCall para retorno de chamadas abandonadas
-- Eventos relevantes: `ABANDON` (abandonou), `CONNECT`/`COMPLETECALLER`/`COMPLETEAGENT` (atendidas), `RETORNADO`/`RETORNO` (já retornadas)
-- Colunas usadas: `callid`, `data2` (número do cliente), `queue`, `event`, `eventdate`
-
-### Fluxo
-1. Polling periódico (configurável, mín 30s) consulta `retorno_clientes` filtrando `event='ABANDON'` do dia atual
-2. Exclui números que já foram atendidos/retornados (subquery NOT EXISTS)
-3. Valida celular brasileiro (11 dígitos com 9° dígito) e aplica whitelist se configurada
-4. Envia template WhatsApp via Meta Cloud API (deduplicação via `VoxcallAbandonedLogs`)
-5. Quando cliente responde, ticket é roteado para fila/operador/agente IA/chatflow configurados
-6. Envio avulso de teste disponível para validar sem simular ligação abandonada
-
-### Arquivos no VoxZap
-- `server/services/voxcall-integration.service.ts` — serviço de polling e envio
-- `server/routes.ts` — endpoints API (GET/POST/PUT config, test-connection, send-test, status, logs, toggle, approved-templates)
-- `server/services/webhook.service.ts` — roteamento de resposta na criação de ticket
-- `client/src/pages/voxcall-integration.tsx` — página admin
-- `prisma/schema.prisma` — modelos VoxcallIntegrations e VoxcallAbandonedLogs
-
-### Tabelas no VoxZap (PostgreSQL interno)
-- **VoxcallIntegrations** — configuração por tenant (credenciais DB criptografadas AES-256-CBC, canal, template, roteamento, whitelist)
-- **VoxcallAbandonedLogs** — log de envios (deduplicação por integrationId+callId, tracking de status sent/error)
+**AMI Originate**: Funcional — usa `Context: MANAGER` com canal `Local/PHONE@MANAGER`
 
 ## Skills Relacionadas
 
