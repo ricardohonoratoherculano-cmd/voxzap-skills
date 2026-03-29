@@ -283,6 +283,47 @@ All Asterisk-related containers MUST use `America/Sao_Paulo` timezone. Without t
 
 **Verification**: `docker exec voxcall-asterisk asterisk -rx "core show settings" | grep time` — Startup time must show Brasília time, NOT UTC.
 
+### 15. Timezone Configuration — VoxZap Containers (CRITICAL)
+VoxZap containers MUST have `tzdata` installed and `/etc/localtime` configured. **PostgreSQL database timezone MUST be UTC.**
+
+**Root cause**: Prisma/pg driver sends timestamps to PostgreSQL WITHOUT the `Z` UTC marker (e.g., `2026-03-29T20:25:46.741` instead of `2026-03-29T20:25:46.741Z`). If PostgreSQL timezone is set to a local timezone (e.g., America/Sao_Paulo), it interprets the bare timestamp as local time, causing a +3h offset in stored data.
+
+**Required configuration:**
+
+1. **VoxZap Dockerfile** — MUST include `tzdata`, `ARG TZ`, `ENV TZ`, and `/etc/localtime`:
+   ```dockerfile
+   RUN apk add --no-cache ffmpeg tzdata
+   ARG TZ=America/Sao_Paulo
+   ENV TZ=${TZ}
+   RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+   ```
+
+2. **docker-compose.yml** — app container needs TZ build arg and env:
+   ```yaml
+   app:
+     build:
+       args:
+         - TZ=America/Sao_Paulo
+     environment:
+       - TZ=America/Sao_Paulo
+   ```
+
+3. **PostgreSQL** — Database timezone MUST be UTC (NOT local timezone):
+   ```sql
+   ALTER DATABASE postgres SET timezone = 'UTC';
+   ```
+   Deploy/update scripts (`server/dockerGenerator.ts`) set this automatically.
+
+4. **Dashboard queries** — Use `AT TIME ZONE 'America/Sao_Paulo'` to convert UTC→local for display:
+   ```sql
+   EXTRACT(HOUR FROM "createdAt" AT TIME ZONE 'America/Sao_Paulo')
+   ```
+
+**Verification**:
+- `docker exec voxzap-app date` — Must show Brasília time (-03), NOT UTC
+- `docker exec voxzap-app ls /etc/localtime` — Must exist
+- PostgreSQL: `SHOW timezone;` — Must return `UTC`
+
 ## TURN Server (coturn) — WebRTC NAT Traversal
 
 ### Why TURN is Required
