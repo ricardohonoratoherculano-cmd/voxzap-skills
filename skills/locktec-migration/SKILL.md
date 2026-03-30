@@ -29,20 +29,21 @@ Já foi executado com sucesso na homologação (Tasks #55 e #56). Este documento
 ## Servidores
 
 ### Locktec — Origem (SOMENTE LEITURA em produção!)
-- **VPS**: `voxzaplocktec.voxserver.app.br`, porta SSH: `22`, user: `root`
+- **VPS**: `$LOCKTEC_HOST` (consultar credenciais no scratchpad da sessão), porta SSH: `$LOCKTEC_SSH_PORT`, user: `root`
 - **PostgreSQL**: container Docker `postgresql`, porta `5432`, user: `zpro`, db: `postgres`
 - **Mídias**: `/home/deployzdg/zpro.io/backend/public/2/` (tenant 2)
 - **Sistema**: ZPro original com Sequelize
 - **tenantId dos dados**: `2`
 
 ### VoxZap — Destino
-- **VPS Homologação**: `voxtel.voxzap.app.br`, porta SSH: `22300`, user: `root`
-- **PostgreSQL**: externo em `voxzap.voxserver.app.br:5432`, user: `zpro`, db: `postgres`
+- **VPS**: `$VOXZAP_HOST` (consultar credenciais no scratchpad da sessão), porta SSH: `$VOXZAP_SSH_PORT`, user: `root`
+- **PostgreSQL**: externo em `$DB_HOST:5432`, user: `zpro`, db: `postgres`
 - **Mídias**: `/opt/voxzap/uploads/` (host) → `/app/uploads` (container Docker `voxzap-app`)
-- **DATABASE_URL**: `postgresql://zpro:%2F62qQgAlvjG2q7Q2bAX9Od1lwya3VdL5us4UyanT1pQ%3D@voxzap.voxserver.app.br:5432/postgres`
+- **DATABASE_URL**: usar variável de ambiente `DATABASE_URL` ou consultar credenciais no scratchpad da sessão
 - **tenantId destino**: `1`
 
-> **IMPORTANTE para produção**: Substituir os dados do servidor destino pelos dados do servidor VoxZap de produção do cliente.
+> **IMPORTANTE**: Todas as credenciais (senhas SSH, DATABASE_URL, tokens) devem ser obtidas do scratchpad da sessão ou de variáveis de ambiente. NUNCA hardcoded neste documento.
+> **Para produção**: Substituir os dados do servidor destino pelos dados do servidor VoxZap de produção do cliente.
 
 ## Pré-requisitos
 
@@ -310,7 +311,7 @@ echo '<chave-publica>' >> /root/.ssh/authorized_keys
 chmod 600 /root/.ssh/authorized_keys
 
 # Testar conexão sem senha
-ssh -o StrictHostKeyChecking=no root@voxzaplocktec.voxserver.app.br 'echo OK'
+ssh -o StrictHostKeyChecking=no root@$LOCKTEC_HOST 'echo OK'
 ```
 
 ### Passo 2 — Transferir mídias com rsync
@@ -320,7 +321,7 @@ ssh -o StrictHostKeyChecking=no root@voxzaplocktec.voxserver.app.br 'echo OK'
 nohup rsync -avz --progress \
   --exclude='baileysBackup/' \
   -e 'ssh -o StrictHostKeyChecking=no' \
-  root@voxzaplocktec.voxserver.app.br:/home/deployzdg/zpro.io/backend/public/2/ \
+  root@$LOCKTEC_HOST:/home/deployzdg/zpro.io/backend/public/2/ \
   /opt/voxzap/uploads/ \
   > /tmp/rsync_media.log 2>&1 &
 
@@ -396,7 +397,7 @@ curl -s -o /dev/null -w "HTTP %{http_code}" "https://<dominio>/uploads/<arquivo.
 # Login
 TOKEN=$(curl -s -X POST "https://<dominio>/api/auth/login" \
   -H "Content-Type: application/json" \
-  -d '{"email":"superadmin@voxtel.biz","password":"<senha>"}' | jq -r '.token')
+  -d '{"email":"$ADMIN_EMAIL","password":"$ADMIN_PASSWORD"}' | jq -r '.token')
 
 # Dashboard stats
 curl -s -H "Authorization: Bearer $TOKEN" "https://<dominio>/api/dashboard/stats"
