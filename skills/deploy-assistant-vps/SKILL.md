@@ -967,3 +967,81 @@ Production database optimization script at `scripts/db-optimize-production.sql`:
 - Cleans up duplicate evaluations before adding constraint
 - **Already applied** to production DB on 2026-03-30. Run on new instances after initial Prisma migration.
 - Note: `CREATE INDEX CONCURRENTLY` cannot run inside a transaction — script must be run outside BEGIN/COMMIT or split into individual statements.
+
+## Replication Assistant (PostgreSQL Logical Replication)
+
+### Overview
+The VoxZap includes a built-in Replication Assistant at `/replication-assistant` (SuperAdmin-only) for configuring PostgreSQL logical replication between primary and replica databases. This allows read-heavy queries (dashboard, reports) to be routed to a replica, reducing load on the primary that handles webhooks and writes.
+
+### Architecture
+
+```
+Writes (webhooks, tickets) → PRIMARY DB → WAL → REPLICA DB → Reads (dashboard, reports)
+```
+
+**Connection helpers** (`server/lib/db-config.ts`):
+- `withExternalPg(fn)` — connects to PRIMARY (`db-config.json`), used for all WRITE operations
+- `withReplicaPg(fn)` — connects to REPLICA (`db-replica-config.json`) with automatic fallback to PRIMARY if replica is unavailable
+- `loadReplicaConfig()` / `saveReplicaConfig()` — manages `db-replica-config.json`
+
+**Current routing**:
+- Dashboard stats (`server/services/dashboard.service.ts`) → uses `withReplicaPg()` for all heavy aggregation queries
+- All other reads → Prisma (PRIMARY)
+- All writes → Prisma (PRIMARY)
+
+### Frontend Page
+- **Route**: `/replication-assistant` (SuperAdminRoute)
+- **File**: `client/src/pages/replication-assistant.tsx`
+- **Menu**: "Replicação DB" in system menu (Copy icon, superadminOnly)
+
+### UI Components
+1. **Status Badge** — real-time badge showing Active (green, with lag + table count) or Inactive
+2. **Replica Config Form** — host, port, database, user, password, SSL toggle
+3. **Replication Config** — replication user name, password, table selection (all or specific)
+4. **5 Guided Steps**:
+   - Step 1: Check Primary — verifies wal_level, publications, replication users
+   - Step 2: Check Replica — verifies connection, subscriptions, tables
+   - Step 3: Configure Primary — creates replication user + PUBLICATION
+   - Step 4: Configure Replica — creates SUBSCRIPTION pointing to primary
+   - Step 5: Verify Status — checks replication lag, active replicas
+5. **Terminal** — colored output panel (green=success, red=error, yellow=warn, blue=info)
+6. **Stop Replication** — drops SUBSCRIPTION and PUBLICATION
+7. **How it Works** — informational card with requirements
+
+### Backend Routes (`server/routes.ts`)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/admin/db-replica-config` | GET | Get current replica config (password masked) |
+| `/api/admin/db-replica-config` | PUT | Save replica config |
+| `/api/admin/db-replica-config/test` | POST | Test replica connection |
+| `/api/admin/replication/check-primary` | POST | Verify primary DB readiness |
+| `/api/admin/replication/check-replica` | POST | Verify replica DB readiness |
+| `/api/admin/replication/configure-primary` | POST | Create replication user + PUBLICATION |
+| `/api/admin/replication/configure-replica` | POST | Create SUBSCRIPTION |
+| `/api/admin/replication/check-status` | POST | Check replication status + lag |
+| `/api/admin/replication/stop` | POST | Stop replication (drop sub + pub) |
+| `/api/admin/replication/quick-status` | GET | Quick status (active, lag, tables) — polled every 30s |
+| `/api/admin/db-tables` | GET | List all tables in primary (for table selector) |
+
+### Requirements for Logical Replication
+- PostgreSQL 10+ on both primary and replica
+- `wal_level = logical` on primary (requires PostgreSQL restart)
+- Replica accessible via network from primary
+- Schema (tables) already created on replica before activating
+- Replication user with `REPLICATION` privilege on primary
+
+### Config Files
+- `db-replica-config.json` — stored in config volume (`/app/config/` in Docker)
+  ```json
+  {
+    "host": "192.168.1.200",
+    "port": 5432,
+    "database": "postgres",
+    "user": "postgres",
+    "password": "...",
+    "ssl": false,
+    "enabled": true,
+    "name": "Réplica"
+  }
+  ```
