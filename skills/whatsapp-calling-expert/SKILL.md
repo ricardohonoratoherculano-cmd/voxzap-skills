@@ -176,9 +176,29 @@ Body: {
 | `calling_turn_url` | URL do servidor TURN (ex: `turn:server.com:3478`) | STUN público do Google |
 | `calling_turn_username` | Username do TURN server | vazio |
 | `calling_turn_credential` | Credential do TURN server | vazio |
+| `rejectCalls` | Recusar chamadas automaticamente (`enabled`/`disabled`) | `disabled` |
+| `rejectCallsMessage` | Mensagem enviada ao chamador quando chamada é rejeitada | `As chamadas de voz e vídeo estão desabilitadas para esse WhatsApp, favor enviar uma mensagem de texto.` |
 
 Configurável na UI: Configurações → Chamadas de Voz (WhatsApp)
 Backend ALLOWED_SETTING_KEYS em routes.ts deve incluir estas chaves para o PUT /api/settings/bulk funcionar.
+
+### Recusar Chamadas Automaticamente (Auto-Reject)
+
+Quando `rejectCalls` está `enabled`, **toda chamada recebida é rejeitada antes de entrar no fluxo normal**.
+
+**Fluxo:**
+1. Webhook recebe evento `connect` (chamada recebida)
+2. `handleIncomingCall` verifica `getTenantSettings(tenantId)["rejectCalls"]`
+3. Se `enabled`:
+   a. Envia `terminate` action via Meta API (`sendCallAction(connection, call_id, "terminate")`)
+   b. Verifica resultado (`terminateResult.success`) e loga sucesso/falha
+   c. Envia mensagem de rejeição via WhatsApp (`sendRejectCallMessage`)
+   d. Retorna imediatamente — **NÃO cria ticket, NÃO notifica operadores, NÃO registra call log**
+4. Se `disabled`: fluxo normal de chamada continua
+
+**Método `sendRejectCallMessage`**: Similar a `sendMissedCallAutoMessage` — envia texto simples via Graph API usando `bmToken` da conexão.
+
+**UI**: Card "Recusar chamadas no WhatsApp" com toggle Switch + Textarea condicional (aparece só quando ativado) + botão Salvar.
 
 ### Template VOICE_CALL — Requisitos Meta
 
@@ -406,7 +426,7 @@ const handleRejectCall = () => {
 
 | Arquivo | Responsabilidade |
 |---------|-----------------|
-| `server/services/calling.service.ts` | Serviço principal — UIC (handleIncomingCall, acceptCall, terminateCall) + BIC (initiateCall, requestCallPermission, getCallPermission, handlePermissionReply) |
+| `server/services/calling.service.ts` | Serviço principal — UIC (handleIncomingCall, acceptCall, terminateCall) + BIC (initiateCall, requestCallPermission, getCallPermission, handlePermissionReply) + Auto-Reject (sendRejectCallMessage) |
 | `server/services/webhook.service.ts` | Processamento de webhooks — campo `calls` (connect, terminate, missed, permission_reply) |
 | `server/routes.ts` | API routes para chamadas (/api/calls/*) e TURN config |
 | `client/src/contexts/call-context.tsx` | GlobalCallProvider — estado global de chamadas, socket listeners, ringtone |
