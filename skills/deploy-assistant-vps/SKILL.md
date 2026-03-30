@@ -39,9 +39,16 @@ This skill documents the architecture, patterns, and conventions for building a 
 ### Update Flow (Code Changes Only) — "Atualizar VoxZap"
 When only application code changed (no infrastructure/config changes):
 - Use the **"Atualizar VoxZap"** quick update button (NOT the full deploy steps)
+- **MANDATORY: Release Notes must be filled before updating.** The UI enforces this:
+  1. User fills Release Notes form (Adicionado/Melhorado/Corrigido — at least one section required)
+  2. User selects bump type (patch/minor/major) and clicks "Registrar Versão"
+  3. This calls `POST /api/version/bump` with `{ bumpType, releaseNotes: { added[], improved[], fixed[] } }` which updates `package.json` version and writes a new entry in `CHANGELOG.md`
+  4. Only after version is registered, the "Atualizar VoxZap" button becomes active
 - This runs `update.sh` which does: build → `prisma db push` (schema sync, **NO data loss**) → restart
 - Route: `POST /api/admin/ssh/deploy/update-and-start` (uploads `update.sh` via SFTP, then runs it)
 - Steps 1-3, 6-8 are NOT needed for simple code updates
+- **Version utility:** `server/lib/version.ts` — `getAppVersion()`, `parseChangelog()`, `bumpVersion()`
+- **Frontend state:** `versionBumped` flag gates the update button; `releaseAdded/releaseImproved/releaseFixed` text fields parsed line-by-line
 
 ### Full Deploy (First Time or Infrastructure Changes)
 Run all 8 steps in order. Step 5 **RESETS THE DATABASE** — only the default SuperAdmin user will exist after deploy. Step 8 (coturn) is now integrated into the guided deploy UI.
@@ -951,3 +958,12 @@ ssh root@voxtel.voxzap.app.br -p 22300 "
 ```bash
 PGPASSWORD='<password>' psql -h voxzap.voxserver.app.br -p 5432 -U zpro -d postgres -f migrations/<file>.sql
 ```
+
+### Database Optimization Script
+Production database optimization script at `scripts/db-optimize-production.sql`:
+- Removes 17 redundant indexes (exact duplicates + prefix-covered)
+- Adds 3 composite indexes: Tickets(tenantId, status, updatedAt DESC), Messages(ticketId, tenantId), Messages(tenantId, createdAt DESC)
+- Adds UNIQUE constraint on TicketEvaluations(ticketId, tenantId)
+- Cleans up duplicate evaluations before adding constraint
+- **Already applied** to production DB on 2026-03-30. Run on new instances after initial Prisma migration.
+- Note: `CREATE INDEX CONCURRENTLY` cannot run inside a transaction — script must be run outside BEGIN/COMMIT or split into individual statements.

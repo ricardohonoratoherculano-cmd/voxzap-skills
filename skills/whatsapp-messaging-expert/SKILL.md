@@ -344,7 +344,9 @@ Webhook POST
       └── Nova Mensagem
           ├── Encontra/cria Contato (pelo número)
           ├── ** Intercepta Resposta de Avaliação (qualquer texto) **
-          │   ├── Busca ticket closed recente (dentro de ratingStoreTime)
+          │   ├── Busca ticket closed recente COM OPERADOR (userId NOT NULL, dentro de ratingStoreTime)
+          │   ├── IMPORTANTE: A query filtra userId: { not: null } direto no banco
+          │   │   para ignorar tickets fechados por bot/#sair
           │   ├── Verifica canal com sendEvaluation=enabled
           │   ├── Verifica tentativas inválidas (Map em memória)
           │   ├── Se válido: salva TicketEvaluations com userId do operador
@@ -424,7 +426,8 @@ O sistema de avaliação permite enviar automaticamente uma pesquisa de satisfa�
 2. Cliente responde com QUALQUER mensagem de texto
    ├── Webhook recebe mensagem de texto (qualquer tipo, não apenas numérica)
    ├── handleEvaluationResponse() intercepta ANTES de criar ticket
-   │   ├── Busca ticket closed recente (updatedAt >= cutoff)
+   │   ├── Busca ticket closed recente COM OPERADOR (updatedAt >= cutoff AND userId IS NOT NULL)
+   │   │   └── CRÍTICO: Filtra userId: { not: null } na query para ignorar tickets fechados por bot/#sair
    │   ├── Verifica canal sendEvaluation === "enabled"
    │   ├── Verifica se já existe avaliação (TicketEvaluations)
    │   │   └── Se sim: retorna false (permite fluxo normal)
@@ -473,8 +476,12 @@ model TicketEvaluations {
   tenantId   Int
   createdAt  DateTime
   updatedAt  DateTime
+
+  @@unique([ticketId, tenantId])          // UNIQUE constraint impede avaliação duplicada
 }
 ```
+
+**Proteção contra race condition:** O `prisma.ticketEvaluations.create()` está envolvido em try/catch que detecta erro Prisma P2002 (unique violation). Se duas mensagens de avaliação chegarem simultaneamente, a segunda é tratada como sucesso (sem erro para o cliente) em vez de criar duplicata.
 
 #### Código-Chave
 
@@ -484,6 +491,12 @@ model TicketEvaluations {
 - **Mensagem inválida com opções:** `server/services/webhook.service.ts` → `buildInvalidRatingMessage()` (substitui `{opcoes}` pelas opções configuradas)
 - **Configuração de notas:** `client/src/pages/avaliacoes.tsx` → Tab "Configurar Avaliações"
 - **Relatório:** `client/src/pages/avaliacoes.tsx` → Tab "Listar Avaliações" (filtros por data/nota/operador)
+
+#### Armadilhas Conhecidas
+
+- **NUNCA buscar "qualquer ticket fechado mais recente"** — sempre filtrar `userId: { not: null }` na query. Tickets fechados por bot/#sair (sem operador) não têm avaliação pendente. Se um ticket bot aparecer como mais recente (ex: por bug de timezone), a avaliação é ignorada e um novo ticket é criado indevidamente.
+- **Ordenação por `updatedAt`** — o `updatedAt` pode ter inconsistências se o PostgreSQL não estiver com timezone=UTC e o Prisma enviar timestamps sem marcador UTC. Sempre garantir que o PostgreSQL use `timezone='UTC'` (ver skill deploy-assistant-vps seção 15).
+- **Avaliação só é enviada para tickets fechados por operador** — o bloco de envio em `PATCH /api/tickets/:id` já verifica `closedTicket.userId`, mas a interceptação da resposta (`handleEvaluationResponse`) também DEVE filtrar por `userId IS NOT NULL` na query do banco.
 
 ### Valores de ACK (Status de Entrega)
 
