@@ -396,6 +396,127 @@ Quando um contato tem **mensagem automática de ausência** no WhatsApp, cada re
 | `botRetries` | Int | Contador de tentativas, resetado após transferência |
 | `firstCall` / `lastCall` | Boolean | Flags de controle de primeira/última chamada |
 
+### Webhook Observability (WebhookLogs)
+
+Sistema completo de logging e visualização de todos os eventos recebidos da Meta (WhatsApp Cloud API) para diagnóstico de problemas em produção (mensagens não recebidas, mudanças de formato, erros de assinatura).
+
+#### Tabela `WebhookLogs`
+
+| Campo | Tipo | Descrição |
+|-------|------|-----------|
+| `id` | Serial PK | ID auto-incremento |
+| `tenantId` | Int? | Tenant identificado (null se não encontrado) |
+| `connectionId` | Int? | Conexão WhatsApp identificada |
+| `eventType` | VarChar(30) | `message`, `status`, `call`, `verification`, `unknown` |
+| `direction` | VarChar(10) | `inbound` (padrão) |
+| `phoneFrom` | VarChar(30)? | Telefone de origem |
+| `phoneTo` | VarChar(30)? | Telefone de destino |
+| `waMessageId` | VarChar(200)? | Message ID do WhatsApp |
+| `messageType` | VarChar(30)? | Tipo da mensagem (text, image, audio...) |
+| `payloadSummary` | Json? | Resumo condensado do payload (sempre gravado) |
+| `fullPayload` | Json? | Payload completo (opt-in via setting `webhookStoreFullPayload`) |
+| `processingResult` | VarChar(20) | `success`, `error`, `rejected`, `not_found`, `ignored` |
+| `errorMessage` | Text? | Mensagem de erro se houver |
+| `processingTimeMs` | Int | Tempo de processamento em ms |
+| `httpStatusCode` | Int | HTTP status retornado (200, 403, 500) |
+| `createdAt` | Timestamptz | Data/hora do evento |
+
+**Índices compostos:** `(tenantId, createdAt)`, `(eventType, createdAt)`
+
+#### Pontos de Logging no Código
+
+```
+server/routes.ts:
+  saveWebhookLog()             ← Helper fire-and-forget (não bloqueia o webhook)
+  buildWebhookPayloadSummary() ← Cria resumo condensado do payload
+
+Pontos de captura:
+  GET  /api/webhook/whatsapp   ← Verificação: success ou rejected
+  POST /api/webhook/whatsapp   ← Assinatura inválida: rejected
+  POST /api/webhook/whatsapp   ← Processamento: success, error, not_found, ignored
+  POST /api/webhook/whatsapp   ← Exceção catch: error
+```
+
+#### processWebhookPayload — Metadados Retornados
+
+```typescript
+interface WebhookProcessingResult {
+  eventTypes: string[];      // Tipos de evento processados
+  tenantId: number | null;   // Tenant identificado
+  connectionId: number | null; // Conexão identificada
+  phoneFrom: string | null;  // Telefone de origem
+  phoneTo: string | null;    // Telefone de destino (phoneNumberId)
+  messageCount: number;      // Quantidade de mensagens
+  statusCount: number;       // Quantidade de status updates
+  callCount: number;         // Quantidade de chamadas
+  waMessageIds: string[];    // IDs de mensagem do WhatsApp
+  messageTypes: string[];    // Tipos de mensagem (text, image...)
+  errors: string[];          // Erros encontrados
+}
+```
+
+#### Classificação de `processingResult`
+
+| Valor | Quando |
+|-------|--------|
+| `success` | Processou mensagens/status/calls sem erro |
+| `error` | Erros no processamento (exceto not_found) |
+| `not_found` | Nenhuma conexão encontrada para o phoneNumberId |
+| `rejected` | Assinatura inválida ou verificação falhou |
+| `ignored` | Payload sem mensagens, status ou calls para processar |
+
+#### fullPayload — Opt-in por Tenant
+
+O campo `fullPayload` só é gravado se a setting `webhookStoreFullPayload` estiver ativa para o tenant:
+
+```
+Tabela Settings:
+  key = "webhookStoreFullPayload"
+  value = "true" (ativa) / qualquer outro (desativa, padrão)
+  tenantId = ID do tenant
+```
+
+Cache em memória por tenant (Map), TTL de 5 minutos. Para `tenantId = null` (evento não identificado), sempre retorna `false`.
+
+#### API Endpoints
+
+```
+GET /api/webhook-logs/stats     ← Estatísticas agregadas (admin/superadmin)
+GET /api/webhook-logs/entries   ← Lista paginada com filtros (admin/superadmin)
+GET /api/webhook-logs/:id       ← Detalhe com payload completo (admin/superadmin)
+```
+
+**Filtros disponíveis:** `startDate`, `endDate`, `eventType`, `processingResult`, `search` (busca em phoneFrom, phoneTo, waMessageId, errorMessage)
+
+**Isolamento multi-tenant:**
+- Admin: só vê logs do seu tenant (`tenantId = X`)
+- SuperAdmin: vê todos os logs
+- Logs com `tenantId = null` só são visíveis para SuperAdmin
+- Detalhe (`/:id`): bloqueia acesso se tenant não confere
+
+**Queries parametrizadas:** Todas as consultas usam `$queryRawUnsafe` com parâmetros posicionais (`$1`, `$2`...) e whitelist de valores para `eventType` e `processingResult`.
+
+#### Cleanup Automático
+
+```typescript
+// Roda a cada 24h, configurável via Settings
+// key = "webhookLogRetentionDays", default = 7
+cleanupOldWebhookLogs()
+setInterval(cleanupOldWebhookLogs, 24 * 60 * 60 * 1000)
+```
+
+#### Frontend — Página `/webhook-logs`
+
+- **Rota:** `/webhook-logs` (AdminRoute)
+- **Menu:** "Webhook Logs" no grupo system (adminOnly), ícone `Webhook` do lucide-react
+- **Arquivo:** `client/src/pages/webhook-logs.tsx`
+- **Componentes:**
+  - 5 cards de métricas (total, sucesso, erros/rejeitados/not_found, tempo médio, verificações)
+  - Tabela com colunas: Data/Hora, Tipo, Tenant, De, Para, Msg Type, Resultado, Tempo, Erro
+  - Filtros: busca texto, tipo de evento, resultado, datas
+  - Dialog de detalhe com JSON do payload (summary + full se disponível)
+  - Paginação
+
 ### Sistema de Avaliação Automática (sendEvaluation)
 
 O sistema de avaliação permite enviar automaticamente uma pesquisa de satisfação ao cliente quando um ticket é fechado, e processar a resposta vinculando ao operador que atendeu.
