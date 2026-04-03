@@ -253,6 +253,41 @@ Para adicionar suporte a novos tipos de dados brasileiros, edite a função `app
 - Se uma regra diz "mascare [TIPO]", formate no padrão [FORMATO] mostrando todos os dígitos. Exemplo: "[BRUTO]" DEVE aparecer como "[FORMATADO]".
 ```
 
+## Safety Net — Proteção contra lastCallChatbot indevido
+
+### Problema (Bug corrigido em Abril/2026)
+O `processMessageWithAgent()` contém um "safety net" regex que detecta padrões de transferência na resposta do bot e seta `lastCallChatbot = false` para evitar que o bot continue respondendo após transferir.
+
+A regex original usava padrões muito amplos como `vou te `, `estou te `, `já estou ` que matchavam frases normais do bot como "Vou te ajudar" ou "Estou te enviando a informação", causando desativação prematura do bot na primeira resposta.
+
+### Correção
+Os padrões regex foram refinados para exigir verbos específicos de transferência:
+
+```typescript
+const safetyPatterns = [
+  /\btransfer|encaminh|direcion|redirecionar/i,
+  /\bvou te (transferir|encaminhar|direcionar|passar para|conectar com)\b/i,
+  /\bestou te (transferindo|encaminhando|direcionando|passando para|conectando com)\b/i,
+  /\bjá estou (transferindo|encaminhando|direcionando|te passando)\b/i,
+  /\bpassar(ei)? (você |vc )?(para|ao|à) (um|uma|o|a) (atendente|operador|humano|agente|especialista)/i,
+  /\bconectar (você |vc )?(com|a) (um|uma|o|a) (atendente|operador|humano|agente|especialista)/i,
+  /\b(atendente|operador|humano|agente|especialista) (vai|irá|poderá) (te )?(atender|ajudar|resolver)/i,
+];
+```
+
+### Regra: Quando lastCallChatbot = false
+`lastCallChatbot` só deve ser setado para `false` em:
+1. **Transferência real** — bot detecta `[TRANSFERIR]` na resposta e executa `tryTransfer()`
+2. **Loop detection** — 3 mensagens idênticas consecutivas do contato
+3. **LLM failure** — quando o LLM falha e não retorna resposta
+4. **closeKeyWord** — contato envia palavra-chave de encerramento
+5. **Safety net** (com padrões refinados) — resposta do bot contém termos explícitos de transferência
+
+### Regra: Quando lastCallChatbot deve permanecer true
+- O bot está conversando normalmente e respondendo perguntas
+- Frases como "Vou te ajudar", "Estou te enviando", "Vou te passar a informação" NÃO devem desativar o bot
+- Apenas frases com verbos de transferência/encaminhamento devem acionar o safety net
+
 ## Segurança
 - API Key nunca enviada ao frontend (mascarada como "••••••" + últimos 4 chars)
 - Na atualização, API key só é alterada se valor não estiver vazio e não começar com "••••"
