@@ -70,6 +70,40 @@ Run all 8 steps in order. Step 5 **RESETS THE DATABASE** — only the default Su
 - **Health check:** Verifies `systemctl is-active coturn` + port 3478 listening after install
 - **Config includes `verbose`** for session-level logging in `/var/log/turnserver.log`
 
+## Post-Deploy Troubleshooting
+
+### Webhooks Parados Após Deploy ("Invalid signature")
+
+**Sintoma:** Após deploy/update, TODAS as mensagens recebidas param de funcionar. Logs mostram:
+```
+[Webhook] POST received, entries=1
+[Webhook] Invalid signature, rejecting payload
+POST /api/webhook/whatsapp 403
+```
+
+**Causa:** O campo `Tenants.metaToken` está preenchido com um valor incorreto (não corresponde ao App Secret real da Meta). Quando o valor existe e é diferente do padrão, a validação HMAC-SHA256 é ativada e rejeita tudo.
+
+**Diagnóstico via SSH:**
+```bash
+docker logs voxzap-app --since 10m 2>&1 | grep "Invalid signature"
+```
+
+**Correção imediata no banco:**
+```sql
+UPDATE "Tenants" SET "metaToken" = 'f69031a3cacc058ea59fe8a7ae710fb4595c146813161cae533ee81c30b7f28c' WHERE id = 1;
+```
+Isso reseta para o valor padrão, pulando a validação de assinatura. Não precisa reiniciar o container — a query é feita em tempo real.
+
+**Nota:** O container NÃO precisa de variável de ambiente `WHATSAPP_APP_SECRET` ou `META_APP_SECRET`. O App Secret é resolvido do banco (`Tenants.metaToken`) por tenant. Ver documentação completa na skill `whatsapp-messaging-expert` → "Validação de Assinatura".
+
+### Verificação de Container VPS
+
+```bash
+docker inspect voxzap-app --format='Created: {{.Created}} Started: {{.State.StartedAt}}'
+docker logs voxzap-app --since 5m 2>&1 | tail -30
+docker exec voxzap-app printenv | grep -E 'NODE_ENV|DATABASE_URL|SESSION_SECRET'
+```
+
 ## CRITICAL RULES — Lessons Learned from Production
 
 ### 1. Database Driver: `pg` in Production, Neon in Development
