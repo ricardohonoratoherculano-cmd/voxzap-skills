@@ -329,6 +329,55 @@ POST /api/webhook/whatsapp  →  Processamento de eventos
 // Comparação: crypto.timingSafeEqual
 ```
 
+#### Resolução do App Secret (resolveAppSecretFromPayload)
+
+O webhook resolve o App Secret dinamicamente por tenant:
+1. Extrai `phoneNumberId` do payload (`metadata.phone_number_id`)
+2. Busca a conexão `Whatsapps` pelo `tokenAPI = phoneNumberId`
+3. Busca o tenant pela conexão → campo `Tenants.metaToken`
+4. Se `metaToken` está configurado (não-vazio e diferente do padrão) → usa como App Secret
+5. Se não → fallback para `process.env.META_APP_SECRET` → se não existe → `null` (validation skipped)
+
+**Valor padrão (skip):** `f69031a3cacc058ea59fe8a7ae710fb4595c146813161cae533ee81c30b7f28c`
+
+Função `isAppSecretConfigured(metaToken)` retorna `false` se:
+- metaToken é null/vazio
+- metaToken é igual ao `META_TOKEN_DEFAULT` acima
+
+#### TROUBLESHOOTING: "Invalid signature, rejecting payload"
+
+**Causa mais comum:** O campo `Tenants.metaToken` foi preenchido com um valor que NÃO corresponde ao App Secret real da aplicação Meta. Quando `isAppSecretConfigured()` retorna `true`, a validação HMAC-SHA256 é ativada e todos os webhooks falham com 403.
+
+**Sintoma:** TODAS as mensagens recebidas param de funcionar. Logs mostram:
+```
+[Webhook] POST received, entries=1
+[Webhook] Invalid signature, rejecting payload
+POST /api/webhook/whatsapp 403
+```
+
+**Diagnóstico:**
+```sql
+SELECT id, name, "metaToken" FROM "Tenants" WHERE id = 1;
+```
+
+**Correção imediata (desbloqueia webhooks):**
+```sql
+UPDATE "Tenants" SET "metaToken" = 'f69031a3cacc058ea59fe8a7ae710fb4595c146813161cae533ee81c30b7f28c' WHERE id = 1;
+```
+Isso reseta para o valor padrão, fazendo `isAppSecretConfigured()` retornar `false` e pular a validação.
+
+**Correção definitiva:** Obter o App Secret correto no Meta for Developers → App Settings → Basic → App Secret, e configurar no painel Webhook do VoxZap.
+
+#### rawBody Capture
+
+O `rawBody` é capturado em `server/index.ts` via `express.json({ verify })`:
+```typescript
+app.use(express.json({
+  verify: (req, _res, buf) => { req.rawBody = buf; },
+}));
+```
+O webhook usa `req.rawBody` (Buffer original) para validar a assinatura. Se `rawBody` não existe, faz fallback para `JSON.stringify(req.body)` — que pode diferir do payload original e causar falha de validação.
+
 ### Fluxo de Processamento
 
 ```
@@ -2076,6 +2125,126 @@ Pipeline completo serializado por ticket via `messageProcessingQueue.enqueue(tic
 const normalize = (s: string) => s.trim().toLowerCase().replace(/\s+/g, "_");
 // Match: normalize(tag_intent) === normalize(route.intentName)
 ```
+
+---
+
+## Sistema de Campanhas WhatsApp
+
+Sistema completo de disparo em massa de templates WhatsApp com dashboard de acompanhamento em tempo real.
+
+### Arquitetura
+
+| Arquivo | Responsabilidade |
+|---------|-----------------|
+| `server/services/campaign.service.ts` | Envio de campanhas: processamento de contatos, disparo de templates, controle de ritmo |
+| `server/routes.ts` | Rotas REST de campanhas (CRUD, start, pause, resume, cancel, contacts, export) |
+| `client/src/pages/campanhas.tsx` | Lista de campanhas + Dashboard de acompanhamento |
+| `prisma/schema.prisma` | Modelos `Campaigns` e `CampaignContacts` |
+
+### Modelo de Dados
+
+#### Campaigns
+| Campo | Tipo | Descrição |
+|-------|------|-----------|
+| `id` | Serial PK | ID auto-incremento |
+| `name` | String | Nome da campanha |
+| `status` | String | `pending`, `scheduled`, `sending`, `paused`, `completed`, `cancelled` |
+| `templateName` | String | Nome do template aprovado |
+| `templateLanguage` | String | Idioma do template |
+| `templateCategory` | String | Categoria do template |
+| `templateComponents` | Json | Componentes do template (header, body, buttons) |
+| `whatsappId` | Int | FK → Whatsapps (canal de envio) |
+| `tenantId` | Int | FK → Tenants |
+| `totalContacts` | Int | Total de contatos na campanha |
+| `sentCount` | Int | Contatos enviados com sucesso |
+| `failedCount` | Int | Contatos com falha |
+| `start` | DateTime (NOT NULL) | Data/hora de início (agendamento ou execução) |
+| `completedAt` | DateTime? | Data/hora de conclusão |
+| `responseRouting` | Json? | Roteamento de respostas: `{type, queueId, aiAgentId, windowHours, autoTagId}` |
+
+#### CampaignContacts
+| Campo | Tipo | Descrição |
+|-------|------|-----------|
+| `id` | Serial PK | ID auto-incremento |
+| `campaignId` | Int | FK → Campaigns |
+| `contactId` | Int? | FK → Contacts (opcional) |
+| `phone` | String | Número do telefone |
+| `name` | String? | Nome do contato |
+| `status` | String | `pending`, `sent`, `failed` |
+| `sentAt` | DateTime? | Data/hora do envio |
+| `errorMessage` | String? | Mensagem de erro se falhou |
+| `templateParams` | Json? | Parâmetros personalizados do template |
+| `waMessageId` | String? | Message ID retornado pela Meta |
+
+### Status Machine
+
+```
+pending/scheduled → Iniciar → sending
+sending → Pausar → paused
+sending → Cancelar → cancelled
+sending → (todos enviados) → completed
+paused → Retomar → sending
+paused → Cancelar → cancelled
+```
+
+### Ações por Status
+
+| Status | Ações Disponíveis |
+|--------|-------------------|
+| `pending` / `scheduled` | Iniciar, Editar, Duplicar |
+| `sending` | Pausar, Cancelar |
+| `paused` | Retomar, Cancelar |
+| `completed` / `cancelled` | Duplicar, Exportar |
+
+### Endpoints API
+
+| Método | Rota | Descrição |
+|--------|------|-----------|
+| GET | `/api/campaigns` | Lista campanhas do tenant |
+| GET | `/api/campaigns/:id` | Detalhes da campanha |
+| POST | `/api/campaigns` | Cria campanha |
+| PATCH | `/api/campaigns/:id` | Atualiza campanha (usa `$queryRawUnsafe` para UPDATE) |
+| DELETE | `/api/campaigns/:id` | Remove campanha |
+| POST | `/api/campaigns/:id/start` | Inicia disparo |
+| POST | `/api/campaigns/:id/pause` | Pausa disparo |
+| POST | `/api/campaigns/:id/resume` | Retoma disparo |
+| POST | `/api/campaigns/:id/cancel` | Cancela disparo |
+| GET | `/api/campaigns/:id/contacts` | Lista contatos paginados |
+| POST | `/api/campaigns/:id/contacts` | Adiciona contatos (array JSON) |
+| GET | `/api/campaigns/:id/export` | Exporta relatório CSV |
+
+**IMPORTANTE — Route ordering:** Rotas específicas (`/start`, `/pause`, `/resume`, `/cancel`, `/contacts`, `/export`) devem ser registradas ANTES da rota genérica `/:id` para evitar que Express interprete "start" como um ID.
+
+### Dashboard (campanhas.tsx)
+
+- **Lista**: Cards com nome, status, progresso, botões de ação
+- **Dashboard**: Navegação automática ao clicar "Iniciar", barra de progresso, lista de contatos paginada, refresh via WebSocket
+- **WebSocket**: Evento `CAMPAIGN_PROGRESS` com `{ campaignId, sentCount, failedCount, totalContacts, status }` → invalida cache de contacts + campaign
+
+### IMPORTANTE — queryClient e IDs no path
+
+O `queryClient` padrão do VoxZap trata `queryKey[1]` como **query params object** (não path segment). Para rotas com ID no path (`/api/campaigns/123`), SEMPRE usar `queryFn` explícita:
+
+```typescript
+useQuery({
+  queryKey: ["/api/campaigns", campaignId],
+  queryFn: () => fetch(`/api/campaigns/${campaignId}`).then(r => r.json()),
+});
+```
+
+**NÃO usar** apenas `queryKey: ["/api/campaigns", campaignId]` sem `queryFn` — o fetcher padrão construirá a URL como `/api/campaigns?0=1&1=2&...` (errado).
+
+### PATCH com $queryRawUnsafe
+
+O campo `start` (DateTime NOT NULL) causa conflitos com Prisma `.update()`. O PATCH da campanha usa `$queryRawUnsafe` com SQL direto:
+
+```typescript
+await prisma.$queryRawUnsafe(`UPDATE "Campaigns" SET ... WHERE id = $1`, id);
+```
+
+### Contatos em Modo Edição
+
+Contatos são **read-only** em modo edição. O upload de contatos só é permitido na criação da campanha. Na edição, os contatos existentes são exibidos mas não podem ser modificados.
 
 ---
 
