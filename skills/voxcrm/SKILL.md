@@ -204,8 +204,8 @@ Configuração:
     "ariPassword": "${ARI_PASSWORD}",
     "ariProtocol": "http",
     "amiPort": 25038,
-    "amiUser": "primax",
-    "amiPassword": "primax@123",
+    "amiUser": "${AMI_USER}",
+    "amiPassword": "${AMI_PASSWORD}",
     "dbHost": "${ASTERISK_DB_HOST}",
     "dbPort": 5432,
     "dbUser": "${ASTERISK_DB_USER}",
@@ -1932,3 +1932,4 @@ function ContactForm({ onSubmit }: { onSubmit: (data: any) => void }) {
 9. **Testes**: data-testid em todos os elementos interativos
 10. **Segurança**: Sanitizar inputs, parametrizar queries (Prisma faz isso), rate limiting
 11. **Contexto Asterisk**: SEMPRE `context: 'MANAGER'` em ARI e AMI — nunca outro contexto
+12. **Segredos**: NUNCA hardcodar credenciais no código ou configurações — usar variáveis de ambiente (`${VAR}`) para todos os tokens, senhas, API keys e secrets
