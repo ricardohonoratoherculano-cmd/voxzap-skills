@@ -20,6 +20,7 @@
   | voxfone-telephony-crm | Sistema CRM de telefonia VoxFone |
   | vpn-management-expert | Gerenciamento de VPN para redes privadas |
   | whatsapp-calling-expert | WhatsApp Business Calling API |
+  | voxtel-asr-tts | Integração Voxtel ASR (transcrição) + TTS (síntese de voz) |
   | whatsapp-messaging-expert | WhatsApp Cloud API e mensageria |
 
   ## Como Usar
