@@ -338,7 +338,7 @@ O webhook resolve o App Secret dinamicamente por tenant:
 4. Se `metaToken` está configurado (não-vazio e diferente do padrão) → usa como App Secret
 5. Se não → fallback para `process.env.META_APP_SECRET` → se não existe → `null` (validation skipped)
 
-**Valor padrão (skip):** `f69031a3cacc058ea59fe8a7ae710fb4595c146813161cae533ee81c30b7f28c`
+**Valor padrão (skip):** Definido como `META_TOKEN_DEFAULT` no código. Consulte o scratchpad do agente para o valor real.
 
 Função `isAppSecretConfigured(metaToken)` retorna `false` se:
 - metaToken é null/vazio
@@ -362,7 +362,7 @@ SELECT id, name, "metaToken" FROM "Tenants" WHERE id = 1;
 
 **Correção imediata (desbloqueia webhooks):**
 ```sql
-UPDATE "Tenants" SET "metaToken" = 'f69031a3cacc058ea59fe8a7ae710fb4595c146813161cae533ee81c30b7f28c' WHERE id = 1;
+UPDATE "Tenants" SET "metaToken" = '<META_TOKEN_DEFAULT_FROM_SCRATCHPAD>' WHERE id = 1;
 ```
 Isso reseta para o valor padrão, fazendo `isAppSecretConfigured()` retornar `false` e pular a validação.
 

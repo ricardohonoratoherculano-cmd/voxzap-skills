@@ -90,7 +90,7 @@ docker logs voxzap-app --since 10m 2>&1 | grep "Invalid signature"
 
 **Correção imediata no banco:**
 ```sql
-UPDATE "Tenants" SET "metaToken" = 'f69031a3cacc058ea59fe8a7ae710fb4595c146813161cae533ee81c30b7f28c' WHERE id = 1;
+UPDATE "Tenants" SET "metaToken" = '<META_TOKEN_FROM_SCRATCHPAD>' WHERE id = 1;
 ```
 Isso reseta para o valor padrão, pulando a validação de assinatura. Não precisa reiniciar o container — a query é feita em tempo real.
 
@@ -404,7 +404,7 @@ systemctl enable --now coturn
 #### VoxZap (voxtel.voxzap.app.br)
 - **VPS:** 72.61.34.151 port 3478 (UDP + TCP)
 - **Realm:** voxtel.voxzap.app.br
-- **User:** voxzap / VoxTurn2026!
+- **User:** voxzap / <TURN_PASSWORD_FROM_SCRATCHPAD>
 - **Config file:** `/etc/turnserver.conf`
 - **Service:** `systemctl status coturn`
 - **Verbose logging:** enabled (`verbose` directive in config)
@@ -414,7 +414,7 @@ systemctl enable --now coturn
 #### VoxCALL (voxdrive.voxtel.app.br)
 - **VPS:** 85.209.93.135 port 3478 (UDP)
 - **Realm:** voxdrive.voxtel.app.br
-- **User:** voxcall / VoxTurn2026!
+- **User:** voxcall / <TURN_PASSWORD_FROM_SCRATCHPAD>
 - **Config file:** `/etc/turnserver.conf`
 - **Service:** `systemctl status coturn`
 
@@ -428,7 +428,7 @@ systemctl enable --now coturn
 - **coturn**: Installed on this VPS for WebRTC TURN relay
 
 ### Asterisk Server (boghos.voxcall.cc)
-- **SSH**: boghos.voxcall.cc:22300, user root, same password as app VPS
+- **SSH**: boghos.voxcall.cc:22300, user root (password in agent scratchpad)
 - **Public IP**: 77.37.69.68
 - **Containers**: `voxcall-asterisk` (network_mode: host), `voxcall-asterisk-db` (PostgreSQL 16-alpine on port 25432)
 - **Purpose**: Runs Asterisk 22 PBX with PJSIP realtime
@@ -476,7 +476,7 @@ File: `sip-webrtc-config.json` (project root, read by `GET /api/sip-webrtc/confi
   "stunServer": "stun:stun.l.google.com:19302",
   "turnServer": "turn:85.209.93.135:3478",
   "turnUsername": "voxcall",
-  "turnPassword": "VoxTurn2026!",
+  "turnPassword": "<TURN_PASSWORD_FROM_SCRATCHPAD>",
   "enabled": true
 }
 ```
@@ -901,7 +901,7 @@ Replace `DOMAIN` with the actual domain (e.g., `voxtel.voxcall.cc`).
 
 **Important:** The Asterisk container MUST have `/etc/letsencrypt` mounted as a volume. The `docker-compose.asterisk.yml` now includes `- /etc/letsencrypt:/etc/letsencrypt:ro` in the asterisk service volumes.
 
-**Note:** Also check `ari.conf` — passwords may be truncated (e.g., `RiCa@853198` instead of full `RiCa@8531989898`).
+**Note:** Also check `ari.conf` — passwords may be truncated (first 10 chars instead of full password). Compare with the ARI password in the agent scratchpad.
 
 ### WebRTC audio issues (one-way or no audio)
 1. Check if coturn is running: `systemctl status coturn`
