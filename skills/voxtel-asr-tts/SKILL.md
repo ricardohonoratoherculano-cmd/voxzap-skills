@@ -145,7 +145,9 @@ Em caso de falha:
 
 O webhook espera resposta `{ "ok": true }` com status 200.
 
-#### 3. Consultar Status do Job (alternativa ao webhook)
+#### 3. Consultar Status do Job (API externa — alternativa ao webhook)
+
+> **Nota**: Este endpoint é da API externa Voxtel, não implementado localmente. Útil para debug ou implementações sem webhook.
 
 ```
 GET /v1/audio/transcriptions/jobs/{job_id}
@@ -162,7 +164,9 @@ Response 200:
 }
 ```
 
-#### 4. Listar Modelos
+#### 4. Listar Modelos (API externa)
+
+> **Nota**: Endpoint da API externa Voxtel para consulta de modelos disponíveis.
 
 ```
 GET /v1/models
@@ -177,6 +181,19 @@ Response 200:
   ]
 }
 ```
+
+### Rotas Implementadas vs API Externa
+
+| Rota | Tipo | Descrição |
+|------|------|-----------|
+| `POST /api/transcribe` | **Implementada** (Express) | Recebe áudio do frontend, submete job async ao ASR, aguarda webhook |
+| `POST /api/webhook/asr` | **Implementada** (Express) | Recebe callback do ASR com resultado da transcrição |
+| `POST /api/tts` | **Implementada** (Express) | Recebe texto do frontend, proxy para TTS, retorna áudio |
+| `POST /v1/audio/transcriptions/async` | **API externa** (Voxtel ASR) | Submissão de job de transcrição assíncrono |
+| `POST /v1/audio/transcriptions` | **API externa** (Voxtel ASR) | Transcrição síncrona (não recomendada) |
+| `GET /v1/audio/transcriptions/jobs/{id}` | **API externa** (Voxtel ASR) | Consulta status de job (alternativa ao webhook) |
+| `GET /v1/models` | **API externa** (Voxtel ASR) | Lista modelos disponíveis |
+| `POST /v1/audio/speech` | **API externa** (Voxtel TTS) | Geração de áudio a partir de texto |
 
 ### Padrão de Implementação ASR com Webhook (TypeScript/Express)
 
@@ -214,7 +231,7 @@ Referência completa: `artifacts/api-server/src/routes/transcribe.ts`
 - **Secret por job**: Cada job gera um secret criptográfico de 32 bytes (hex)
 - **Validação**: O secret é passado como `?secret=...` na webhook_url e validado no recebimento
 - **Replay protection**: Jobs sem secret registrado são rejeitados com 403
-- **Cleanup automático**: Secrets são removidos após uso ou timeout
+- **Cleanup**: Secrets são removidos do mapa após validação bem-sucedida do webhook callback
 
 ---
 
@@ -303,18 +320,25 @@ Referência completa: `artifacts/api-server/src/routes/tts.ts`
 
 O backend retorna `errorCode` que o frontend traduz conforme o idioma selecionado:
 
+**ASR (Transcrição):**
+
 | Código | Descrição | HTTP Status |
 |--------|-----------|-------------|
 | `TIMEOUT` | Webhook não respondeu a tempo (10min) | 504 |
 | `FILE_TOO_LARGE` | Arquivo excede 25MB | 413 |
-| `SERVICE_UNAVAILABLE` | API indisponível ou token inválido | 500/502 |
+| `SERVICE_UNAVAILABLE` | API indisponível ou token inválido | 500 |
 | `UNSUPPORTED_FORMAT` | Formato de áudio não suportado | 400 |
 | `NO_FILE` | Nenhum arquivo enviado | 400 |
-| `TRANSCRIPTION_FAILED` | Erro genérico de transcrição | 500 |
+
+**TTS (Síntese de Voz):**
+
+| Código | Descrição | HTTP Status |
+|--------|-----------|-------------|
 | `NO_INPUT` | Texto TTS vazio | 400 |
 | `INPUT_TOO_LONG` | Texto TTS excede 4096 chars | 400 |
-| `TTS_FAILED` | Erro genérico de TTS | 500 |
+| `TTS_FAILED` | Erro na API TTS upstream | 400/502 |
 | `RATE_LIMITED` | Muitas requisições (429 upstream) | 429 |
+| `SERVICE_UNAVAILABLE` | API indisponível ou token inválido | 500 |
 
 ---
 
