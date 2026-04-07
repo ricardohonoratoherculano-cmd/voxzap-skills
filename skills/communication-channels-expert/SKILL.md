@@ -259,6 +259,47 @@ Campos webchat:
 webchatColor, webchatPosition, webchatTitle, webchatSubtitle
 ```
 
+## WebChat — Arquitetura Rich Media
+
+### Arquivos Principais
+| Arquivo | Função |
+|---------|--------|
+| `server/public-webchat/widget.js` | Widget embeddable (JS puro, ~1200 linhas). Renderiza chat, mídia, upload, Socket.io |
+| `server/services/webchat.service.ts` | Salva mensagens, processa uploads (multer), gera respostas |
+| `server/websocket/socket.ts` | Namespace `/webchat` — handshake, mensagens, histórico |
+| `server/routes.ts` | Endpoint `/api/download/audio/:filename` (ffmpeg webm→mp3) |
+
+### Tipos de Mídia WebChat
+| Tipo | Body Pattern | mediaUrl | dataJson |
+|------|-------------|----------|----------|
+| Imagem | `[IMAGE] url` | URL do arquivo | `{ fileName, fileSize, mimeType }` |
+| Áudio | `[AUDIO] url` | URL do arquivo (.webm) | `{ fileName, fileSize, mimeType: "audio/webm" }` |
+| Documento | `[DOCUMENT] url` | URL do arquivo | `{ fileName, fileSize, mimeType }` |
+
+### Upload Flow
+1. Widget: input `file` ou `MediaRecorder` (webm/opus) → valida client-side (10MB, tipos permitidos)
+2. `socket.emit('webchat:message', { type: 'media', file: base64, ...metadata })`
+3. Backend: `webchat.service.ts` salva arquivo em disco, cria mensagem com `mediaType: "document"|"image"|"audio"`, `mediaUrl`, `dataJson`
+4. `socket.emit` broadcast para operador + visitor
+
+### Widget Rendering (JS Puro)
+- **Imagens**: `<img>` com click-to-open, sem filename redundante
+- **Áudio**: Custom player (`new Audio()`) com botão play/pause, barra de progresso clicável, tempo atual/total
+- **Documentos**: Card com ícone SVG, badge de extensão (PDF/DOCX/etc), nome, tamanho, botão download
+- **Bolhas**: Visitante = fundo escuro `#1a1a2e`, texto `#f0f2f5` | Operador = fundo `#f0f2f5`, texto `#1a1a2e`
+- **Dark mode**: CSS via `@media(prefers-color-scheme:dark)` com estilos específicos para `.vwc-msg-operator`
+
+### Painel do Operador (atendimento.tsx)
+- `renderMedia()` normaliza `"file"` → `"document"` para compatibilidade
+- `AudioPlayer` componente React customizado: play/pause, progress bar seek, velocidade (1x/1.5x/2x), download MP3 via `/api/download/audio/:filename`
+- Imagens e documentos renderizados inline com thumbnails e download links
+
+### Endpoint de Download de Áudio
+```
+GET /api/download/audio/:filename
+```
+Converte `.webm` → `.mp3` via ffmpeg (`/usr/bin/ffmpeg` no container). Requer autenticação.
+
 ## Padrões para Adicionar Novo Canal
 
 1. **Schema**: Identificar campos necessários na tabela `Whatsapps` (ou adicionar novo campo JSON)
@@ -279,7 +320,7 @@ webchatColor, webchatPosition, webchatTitle, webchatSubtitle
 | Instagram | Mesmo padrão | Badge rosa no ticket list |
 | Messenger | Mesmo padrão | Badge azul no ticket list |
 | Email | `[EMAIL] subject\n\nbody` | Header com assunto + Mail icon, HTML sanitizado, anexos com Paperclip links |
-| WebChat | Texto simples | Sem rendering especial |
+| WebChat | `[IMAGE]`, `[AUDIO]`, `[DOCUMENT]` | Rich media: custom audio player (play/pause, progress bar, seek, speed control, MP3 download via ffmpeg), file card com badge de extensão (PDF/DOCX etc), imagem expandível. Widget.js renderiza mídia com JS puro (custom `new Audio()` player, sem `<audio>` nativo). Upload via Socket.io com validação client-side (10MB, tipos permitidos). Bolhas: visitante = fundo escuro (#1a1a2e), operador = fundo claro (#f0f2f5). Arquivos servidos de `server/public-webchat/`. `dataJson` armazena `fileName`, `fileSize`, `mimeType`. Download de áudio como MP3 via endpoint `/api/download/audio/:filename` (ffmpeg webm→mp3). |
 
 ## Controle de Acesso
 
