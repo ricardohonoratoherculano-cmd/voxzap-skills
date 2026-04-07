@@ -259,15 +259,70 @@ Campos webchat:
 webchatColor, webchatPosition, webchatTitle, webchatSubtitle
 ```
 
-## WebChat — Arquitetura Rich Media
+## WebChat — Arquitetura Completa
 
 ### Arquivos Principais
 | Arquivo | Função |
 |---------|--------|
-| `server/public-webchat/widget.js` | Widget embeddable (JS puro, ~1200 linhas). Renderiza chat, mídia, upload, Socket.io |
-| `server/services/webchat.service.ts` | Salva mensagens, processa uploads (multer), gera respostas |
-| `server/websocket/socket.ts` | Namespace `/webchat` — handshake, mensagens, histórico |
-| `server/routes.ts` | Endpoint `/api/download/audio/:filename` (ffmpeg webm→mp3) |
+| `server/public-webchat/widget.js` | Widget embeddable (JS puro, ~1700 linhas). Renderiza chat, mídia, upload, avaliação, sessão, Socket.io |
+| `server/services/webchat.service.ts` | Sessões, tickets, contatos, cooldown, integração AI Agent |
+| `server/websocket/socket.ts` | Namespace `/webchat` — handshake, mensagens, avaliação, AI Agent processing |
+| `server/routes.ts` | REST API webchat, fechamento de ticket (farewell + avaliação), ghost cleanup |
+
+### Fluxo de Sessão WebChat
+1. Widget carrega → conecta Socket.io `/webchat` com `channelToken`
+2. `init_session` → backend cria/encontra contato + ticket (com `lastCallChatbot: true` se AI Agent configurado)
+3. `session_ready` → widget mostra chat (ou pre-chat form se configurado)
+4. Mensagens trocadas via `visitor_message` / `operator_message`
+5. Operador fecha ticket → farewell + avaliação (se ativa) + `webchat:ticket_closed`
+
+### Integração com AI Agent
+O WebChat segue o **mesmo fluxo** dos outros canais para AI Agent:
+- Se o canal (`Whatsapps`) tem `aiAgentId` configurado, o ticket é criado com `lastCallChatbot: true`
+- Após salvar mensagem do visitante, `handleWebchatAiAgent()` em `socket.ts`:
+  - Verifica `connection.aiAgentId`, ticket `pending`, `lastCallChatbot`
+  - Valida agente ativo com API key
+  - Detecção de loop (mesma mensagem repetida N vezes)
+  - Usa `messageProcessingQueue` + `processMessageWithAgent()`
+  - Salva resposta do bot como mensagem, emite `operator_message` ao visitante
+  - Broadcast `NEW_MESSAGE` para operadores
+  - Trata transferência para fila humana e cenários de fallback
+- Resposta da IA chega ao widget via evento `operator_message` (mesmo canal que mensagens de operador humano)
+
+### Ghost Ticket Prevention
+Tickets fantasma (vazios, sem mensagens) eram criados quando o widget reconectava após fechamento:
+- **Cooldown guard** em `webchat.service.ts`: `initSession()` verifica se último ticket webchat foi fechado nos últimos 5 min; retorna `sessionEnded: true` em vez de criar ticket novo
+- **forceNew flag**: Quando visitante clica "Iniciar nova conversa", envia `forceNew: true` que pula o cooldown
+- **Ghost cleanup job**: A cada 30 min, fecha tickets webchat com status `pending`, sem mensagens (`lastMessage: null`), >5 min de idade
+- **Socket handler**: Quando `sessionEnded`, seta `ticketId = null`, emite `session_ready` + `webchat:ticket_closed`, não faz broadcast `NEW_TICKET`
+- **Widget state**: `sessionEnded` persistido em localStorage; `sendMessage` bloqueado; `visitor_message` no server rejeitado quando `!socket.data.ticketId`
+
+### Fluxo de Fechamento de Ticket
+Quando operador fecha ticket webchat (PATCH `/api/tickets/:id`):
+1. Status atualizado para `closed` no banco
+2. `broadcastTicketUpdate` para painel do operador
+3. **Mensagem de despedida** (`farewellMessage`) enviada via `whatsappService.sendMessage` → `emitToWebchatSession` `operator_message`
+4. **Avaliação** (se `sendEvaluation === "enabled"`):
+   - Mensagem de avaliação enviada como `operator_message`
+   - 1.5s depois: `webchat:awaiting_evaluation` emitido com `options` (rating configurado no tenant)
+   - Widget mostra UI de avaliação com **botões estrela** interativos + "Pular avaliação"
+   - Visitante clica estrela → `webchat:submit_evaluation` → server salva em `TicketEvaluations` → mensagem de agradecimento → 2s depois `webchat:ticket_closed`
+   - Timeout de 60s: se visitante não avaliar, `webchat:ticket_closed` emitido automaticamente
+5. **Sem avaliação**: `webchat:ticket_closed` emitido após 1.5s
+6. Widget: substitui input por footer "Atendimento encerrado" + botão "Iniciar nova conversa" (mantém mensagens visíveis)
+
+### Eventos Socket.io WebChat
+| Evento | Direção | Payload | Descrição |
+|--------|---------|---------|-----------|
+| `init_session` | Client→Server | `{ sessionId?, visitorName?, visitorEmail?, forceNew? }` | Inicia/retoma sessão |
+| `session_ready` | Server→Client | `{ sessionId, ticketId }` | Sessão pronta |
+| `visitor_message` | Client→Server | `{ body }` | Mensagem do visitante |
+| `operator_message` | Server→Client | `{ id, body, fromMe, createdAt }` | Mensagem do operador/bot |
+| `message_ack` | Server→Client | `{ messageId }` | Confirmação de recebimento |
+| `webchat_config` | Server→Client | `{ color, title, ... }` | Configuração visual do widget |
+| `webchat:ticket_closed` | Server→Client | `{ reason }` | Ticket encerrado |
+| `webchat:awaiting_evaluation` | Server→Client | `{ ticketId, userId, options[] }` | Solicita avaliação |
+| `webchat:submit_evaluation` | Client→Server | `{ ticketId, rating, userId }` | Envia nota |
 
 ### Tipos de Mídia WebChat
 | Tipo | Body Pattern | mediaUrl | dataJson |
@@ -287,7 +342,18 @@ webchatColor, webchatPosition, webchatTitle, webchatSubtitle
 - **Áudio**: Custom player (`new Audio()`) com botão play/pause, barra de progresso clicável, tempo atual/total
 - **Documentos**: Card com ícone SVG, badge de extensão (PDF/DOCX/etc), nome, tamanho, botão download
 - **Bolhas**: Visitante = fundo escuro `#1a1a2e`, texto `#f0f2f5` | Operador = fundo `#f0f2f5`, texto `#1a1a2e`
-- **Dark mode**: CSS via `@media(prefers-color-scheme:dark)` com estilos específicos para `.vwc-msg-operator`
+- **Dark mode**: CSS via `@media(prefers-color-scheme:dark)` com estilos específicos para todos componentes
+- **Avaliação**: Estrelas interativas com hover highlight, "Pular avaliação", dark mode completo
+
+### Widget State Machine
+```
+INIT → PRE_CHAT (se formulário configurado) → CHAT_ACTIVE → AWAITING_EVALUATION (se ativo) → SESSION_ENDED
+                                                    ↓                                              ↓
+                                              TICKET_CLOSED (sem avaliação)              INICIAR_NOVA_CONVERSA
+                                                    ↓                                              ↓
+                                              SESSION_ENDED ────────────────────────────→ INIT (forceNew)
+```
+States persistidos em `localStorage`: `sessionId`, `sessionEnded`, `preChatCompleted`, `visitorName`, `visitorEmail`
 
 ### Painel do Operador (atendimento.tsx)
 - `renderMedia()` normaliza `"file"` → `"document"` para compatibilidade
