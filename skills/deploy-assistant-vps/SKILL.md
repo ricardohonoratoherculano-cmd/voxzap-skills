@@ -70,6 +70,40 @@ Run all 8 steps in order. Step 5 **RESETS THE DATABASE** — only the default Su
 - **Health check:** Verifies `systemctl is-active coturn` + port 3478 listening after install
 - **Config includes `verbose`** for session-level logging in `/var/log/turnserver.log`
 
+## Post-Deploy Troubleshooting
+
+### Webhooks Parados Após Deploy ("Invalid signature")
+
+**Sintoma:** Após deploy/update, TODAS as mensagens recebidas param de funcionar. Logs mostram:
+```
+[Webhook] POST received, entries=1
+[Webhook] Invalid signature, rejecting payload
+POST /api/webhook/whatsapp 403
+```
+
+**Causa:** O campo `Tenants.metaToken` está preenchido com um valor incorreto (não corresponde ao App Secret real da Meta). Quando o valor existe e é diferente do padrão, a validação HMAC-SHA256 é ativada e rejeita tudo.
+
+**Diagnóstico via SSH:**
+```bash
+docker logs voxzap-app --since 10m 2>&1 | grep "Invalid signature"
+```
+
+**Correção imediata no banco:**
+```sql
+UPDATE "Tenants" SET "metaToken" = '<META_TOKEN_FROM_SCRATCHPAD>' WHERE id = 1;
+```
+Isso reseta para o valor padrão, pulando a validação de assinatura. Não precisa reiniciar o container — a query é feita em tempo real.
+
+**Nota:** O container NÃO precisa de variável de ambiente `WHATSAPP_APP_SECRET` ou `META_APP_SECRET`. O App Secret é resolvido do banco (`Tenants.metaToken`) por tenant. Ver documentação completa na skill `whatsapp-messaging-expert` → "Validação de Assinatura".
+
+### Verificação de Container VPS
+
+```bash
+docker inspect voxzap-app --format='Created: {{.Created}} Started: {{.State.StartedAt}}'
+docker logs voxzap-app --since 5m 2>&1 | tail -30
+docker exec voxzap-app printenv | grep -E 'NODE_ENV|DATABASE_URL|SESSION_SECRET'
+```
+
 ## CRITICAL RULES — Lessons Learned from Production
 
 ### 1. Database Driver: `pg` in Production, Neon in Development
@@ -370,7 +404,7 @@ systemctl enable --now coturn
 #### VoxZap (voxtel.voxzap.app.br)
 - **VPS:** 72.61.34.151 port 3478 (UDP + TCP)
 - **Realm:** voxtel.voxzap.app.br
-- **User:** voxzap / VoxTurn2026!
+- **User:** voxzap / <TURN_PASSWORD_FROM_SCRATCHPAD>
 - **Config file:** `/etc/turnserver.conf`
 - **Service:** `systemctl status coturn`
 - **Verbose logging:** enabled (`verbose` directive in config)
@@ -380,7 +414,7 @@ systemctl enable --now coturn
 #### VoxCALL (voxdrive.voxtel.app.br)
 - **VPS:** 85.209.93.135 port 3478 (UDP)
 - **Realm:** voxdrive.voxtel.app.br
-- **User:** voxcall / VoxTurn2026!
+- **User:** voxcall / <TURN_PASSWORD_FROM_SCRATCHPAD>
 - **Config file:** `/etc/turnserver.conf`
 - **Service:** `systemctl status coturn`
 
@@ -394,7 +428,7 @@ systemctl enable --now coturn
 - **coturn**: Installed on this VPS for WebRTC TURN relay
 
 ### Asterisk Server (boghos.voxcall.cc)
-- **SSH**: boghos.voxcall.cc:22300, user root, same password as app VPS
+- **SSH**: boghos.voxcall.cc:22300, user root (password in agent scratchpad)
 - **Public IP**: 77.37.69.68
 - **Containers**: `voxcall-asterisk` (network_mode: host), `voxcall-asterisk-db` (PostgreSQL 16-alpine on port 25432)
 - **Purpose**: Runs Asterisk 22 PBX with PJSIP realtime
@@ -442,7 +476,7 @@ File: `sip-webrtc-config.json` (project root, read by `GET /api/sip-webrtc/confi
   "stunServer": "stun:stun.l.google.com:19302",
   "turnServer": "turn:85.209.93.135:3478",
   "turnUsername": "voxcall",
-  "turnPassword": "VoxTurn2026!",
+  "turnPassword": "<TURN_PASSWORD_FROM_SCRATCHPAD>",
   "enabled": true
 }
 ```
@@ -867,7 +901,7 @@ Replace `DOMAIN` with the actual domain (e.g., `voxtel.voxcall.cc`).
 
 **Important:** The Asterisk container MUST have `/etc/letsencrypt` mounted as a volume. The `docker-compose.asterisk.yml` now includes `- /etc/letsencrypt:/etc/letsencrypt:ro` in the asterisk service volumes.
 
-**Note:** Also check `ari.conf` — passwords may be truncated (e.g., `RiCa@853198` instead of full `RiCa@8531989898`).
+**Note:** Also check `ari.conf` — passwords may be truncated (first 10 chars instead of full password). Compare with the ARI password in the agent scratchpad.
 
 ### WebRTC audio issues (one-way or no audio)
 1. Check if coturn is running: `systemctl status coturn`
