@@ -464,24 +464,6 @@ UPDATE \"Messages\" SET \"tenantId\" = 1 WHERE \"tenantId\" = 2;
 
 ---
 
-## Compatibilidade com Índice Anti-Duplicação
-
-O VoxZap possui um índice parcial único `idx_tickets_one_open_per_contact` que impede 2 tickets ativos (open/pending/paused) para o mesmo contato+tenant+whatsappId. **Este índice NÃO interfere na migração** porque:
-
-1. A migração faz `TRUNCATE "Tickets" CASCADE` antes do import — tabela vazia, sem conflitos
-2. Os 183K tickets da Locktec são históricos (status `closed`) — o índice parcial só atua sobre `open/pending/paused`
-3. Se por acaso existir um ticket aberto duplicado nos dados da Locktec, a migração deve fechar o mais antigo antes do import
-
-**Verificação pré-migração recomendada** (executar no banco origem antes de importar):
-```sql
-SELECT "contactId", COUNT(*) as cnt
-FROM "Tickets"
-WHERE status IN ('open', 'pending', 'paused')
-GROUP BY "contactId"
-HAVING COUNT(*) > 1;
-```
-Se retornar resultados, fechar os duplicados mais antigos antes de migrar.
-
 ## Resultado da Homologação (Referência)
 
 Executada com sucesso em março/2026:
