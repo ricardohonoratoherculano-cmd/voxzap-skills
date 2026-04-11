@@ -1055,7 +1055,8 @@ await prisma.$executeRawUnsafe(
 findByEmail(email)                          // Login (inclui tenant)
 findById(id)                                // Por ID (inclui tenant)
 updatePresence(userId, status, isOnline)    // Atualizar presença
-setOnline(userId) / setOffline(userId)      // Helpers de presença
+setOnline(userId)                           // Conexão WebSocket/login — PRESERVA status "pause"
+setOffline(userId)                          // Desconexão WebSocket — PRESERVA status "pause"
 findOperatorsWithStats(tenantId)            // Operadores com contagem de tickets
 ```
 
@@ -1507,14 +1508,53 @@ Padrão profissional de isolamento (como Zendesk/Freshdesk):
 
 ```typescript
 // Auto-online: no login e conexão WebSocket
+// IMPORTANTE: setOnline() PRESERVA status "pause" — se operador está pausado,
+// apenas marca isOnline=true sem alterar status/pausedAt/currentPauseReasonId.
+// O broadcast WebSocket envia status correto ("pause" ou "online").
 userRepository.setOnline(userId);
 
 // Auto-offline: no logout e desconexão WebSocket
+// IMPORTANTE: setOffline() PRESERVA status "pause" — se operador está pausado,
+// apenas marca isOnline=false sem alterar status para "offline".
 userRepository.setOffline(userId);
 
 // Status manual: online, offline, pause
 PATCH /api/users/:id/presence
 Body: { status: "online" | "offline" | "pause" }
+// Quando status="pause", requer pauseReasonId no body
+```
+
+### Sistema de Pausa do Operador
+
+O sistema de pausa é um controle profissional que impede operadores pausados de receberem novos tickets:
+
+**Tabelas Prisma:**
+- `PauseReasons` — Motivos de pausa configuráveis (nome, ícone, cor, ativo, ordem)
+- `UserPauseHistory` — Histórico completo (userId, pauseReasonId, startedAt, endedAt, duration)
+- `Users.status` — "online" | "offline" | "pause"
+- `Users.pausedAt` — timestamp do início da pausa
+- `Users.currentPauseReasonId` — FK para PauseReasons
+
+**Bloqueio em 3 camadas:**
+1. **Distribuição automática** (`webhook.service.ts`): Antes de atribuir ticket, verifica `assignedUser.status !== "pause"`. Se pausado, ticket fica `pending` com `userId=null`.
+2. **Aceite manual** (`PATCH /api/tickets/:id`): Quando operador tenta aceitar ticket pending, verifica status. Se pausado → 403 "Você está em pausa. Retome o atendimento para aceitar novos tickets."
+3. **Persistência de pausa** (`user.repository.ts`): `setOnline()`/`setOffline()` verificam status antes de atualizar. Se "pause", apenas mudam `isOnline` sem resetar pausa. Reconexão WebSocket, refresh de página e login NÃO removem a pausa.
+
+**Frontend (sidebar):**
+- Botão de pausa no sidebar com dialog de seleção de motivo
+- Timer em tempo real mostrando duração da pausa
+- Badge visual de status (online/offline/pausa) no sidebar
+- Toast de erro quando operador pausado tenta aceitar ticket
+
+**Endpoints:**
+```
+GET    /api/pause-reasons                — Lista motivos ativos
+POST   /api/pause-reasons                — Cria motivo (admin)
+PUT    /api/pause-reasons/:id            — Edita motivo
+DELETE /api/pause-reasons/:id            — Remove motivo
+PATCH  /api/users/:id/presence           — Altera status (online/offline/pause)
+GET    /api/users/pause-history          — Histórico de pausas com filtros
+GET    /api/users/operators              — Operadores com stats (inclui pausa)
 ```
 
 ## Padrões de UI das Páginas
