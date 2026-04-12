@@ -366,6 +366,21 @@ GET /api/download/audio/:filename
 ```
 Converte `.webm` → `.mp3` via ffmpeg (`/usr/bin/ffmpeg` no container). Requer autenticação.
 
+## Normalização de Telefone para Todos os Canais
+
+Todos os canais que recebem números de telefone (WABA, Baileys, UazAPI, Telegram) utilizam o módulo centralizado `server/lib/phone-utils.ts`:
+
+| Função | Uso |
+|--------|-----|
+| `normalizeBrazilianPhone()` | Adiciona DDI `55` e nono dígito se necessário |
+| `getAlternatePhoneNumber()` | Gera variante com/sem nono dígito para retry |
+| `buildPhoneSearchNumbers()` | Gera TODAS as variantes para busca anti-duplicação (com/sem DDI, com/sem 9º dígito) |
+| `validateBrazilianPhone()` | Validação completa com DDD check |
+
+**`buildPhoneSearchNumbers()`** é essencial para evitar tickets duplicados: gera variantes sem DDI `55` para encontrar contatos migrados de sistemas legados (ex: Locktec/ZPro) que podem estar armazenados sem o prefixo internacional.
+
+O endpoint `POST /api/new-conversation` auto-normaliza o número do contato existente quando selecionado via `contactId`, corrigindo progressivamente contatos legados.
+
 ## Padrões para Adicionar Novo Canal
 
 1. **Schema**: Identificar campos necessários na tabela `Whatsapps` (ou adicionar novo campo JSON)

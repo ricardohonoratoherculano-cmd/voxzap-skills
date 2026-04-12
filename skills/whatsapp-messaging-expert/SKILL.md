@@ -716,11 +716,11 @@ Todos os celulares brasileiros usam o nono dígito (9) desde Nov/2016 em todos o
 
 ### Função `normalizeBrazilianPhone()`
 
-Presente em: `whatsapp.service.ts`, `webhook.service.ts`, `calling.service.ts`, `voxcall-integration.service.ts`, `routes.ts`
+Centralizada em: `server/lib/phone-utils.ts` (importada por todos os serviços)
 
 ```typescript
 function normalizeBrazilianPhone(phone: string): string {
-  // 1. Remove não-dígitos e adiciona DDI 55 se necessário
+  // 1. Remove não-dígitos e adiciona DDI 55 se necessário (10 ou 11 dígitos → 55 + número)
   // 2. Se número local tem 8 dígitos e não começa com 0 (fixo): ADICIONA o 9
   // NUNCA remove o nono dígito — a Meta normaliza do lado deles
 }
@@ -732,6 +732,19 @@ Gera o número no formato alternativo (com/sem o 9) para busca de contatos e ret
 - Se tem 9 dígitos locais começando com 9 → gera versão SEM o 9 (12 dígitos)
 - Se tem 8 dígitos locais → gera versão COM o 9 (13 dígitos)
 
+### Função `buildPhoneSearchNumbers()`
+
+Centralizada em: `server/lib/phone-utils.ts`. Gera TODAS as variantes de busca para um número de telefone, garantindo match com contatos armazenados em qualquer formato (legado ou normalizado).
+
+Para o número `5585976020655`, gera:
+1. `5585976020655` — normalizado completo (13 dígitos)
+2. `558576020655` — sem nono dígito (12 dígitos)
+3. `85976020655` — sem DDI, com nono dígito (11 dígitos)
+4. `8576020655` — sem DDI, sem nono dígito (10 dígitos)
+5. O número raw original (se diferente dos acima)
+
+**Isso é essencial para contatos migrados (ex: Locktec) que podem estar armazenados sem o DDI `55`.** Sem essas variantes sem DDI, o webhook não encontra o contato existente e cria um duplicado, causando tickets duplicados.
+
 ### Retry Automático no Envio (`sendToMeta`)
 
 Se o envio falhar com erro de destinatário (códigos 131026, 100, subcodes 2388055, 1245301, ou mensagem contendo "recipient"), o sistema automaticamente:
@@ -742,10 +755,19 @@ Se o envio falhar com erro de destinatário (códigos 131026, 100, subcodes 2388
 ### Busca de Contatos Anti-Duplicação
 
 Na recepção de mensagens (`findOrCreateContact` em `webhook.service.ts`) e chamadas (`calling.service.ts`):
-1. Normaliza o número recebido (adiciona 9 se faltando)
-2. Busca no banco por AMBAS as variações (com e sem o 9) usando `{ in: [...] }`
-3. Se encontrar contato com número no formato antigo, atualiza automaticamente para o formato normalizado
-4. Evita criação de contatos duplicados para o mesmo número
+1. Normaliza o número recebido via `normalizeBrazilianPhone()`
+2. Gera todas as variantes via `buildPhoneSearchNumbers()` (com/sem DDI, com/sem nono dígito)
+3. Busca no banco por TODAS as variações usando `{ in: searchNumbers }`
+4. Se encontrar contato com número no formato antigo, atualiza automaticamente para o formato normalizado
+5. Evita criação de contatos duplicados para o mesmo número
+
+### Auto-Normalização na Nova Conversa
+
+O endpoint `POST /api/new-conversation`, quando recebe um `contactId` de contato existente:
+1. Verifica se o número do contato está normalizado
+2. Se não estiver (ex: sem DDI `55`), normaliza automaticamente
+3. Verifica conflito antes de atualizar (proteção anti-duplicata com check Prisma P2002)
+4. Log: `[NewConversation] Auto-normalizing contact X number from Y to Z`
 
 ### IMPORTANTE
 
@@ -754,6 +776,7 @@ Na recepção de mensagens (`findOrCreateContact` em `webhook.service.ts`) e cha
 - Números de telefone fixo (começam com 0) são mantidos como estão
 - A rota `POST /api/contacts/check-ninth-digit` existe para correção em massa de contatos existentes
 - NUNCA remover o nono dígito na normalização — a Meta aceita ambos os formatos e faz a normalização interna
+- `buildPhoneSearchNumbers()` DEVE gerar variantes sem DDI para compatibilidade com dados migrados de sistemas legados
 
 ## Contatos (Contacts)
 
