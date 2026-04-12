@@ -707,40 +707,42 @@ model TicketEvaluations {
 
 ### Regra do 9° Dígito
 
-Todos os DDDs do Brasil já implementaram o nono dígito para celulares (desde Nov/2016). Porém, a API do WhatsApp da Meta tem comportamento diferente por região:
+Todos os celulares brasileiros usam o nono dígito (9) desde Nov/2016 em todos os DDDs. A Meta Cloud API aceita ambos os formatos e normaliza internamente. O sistema sempre envia COM o nono dígito para garantir entrega.
 
-| DDD | Formato WhatsApp API | Comprimento Total | Regra |
-|-----|---------------------|-------------------|-------|
-| 11-28 | `55` + DDD + `9XXXXXXXX` | 13 dígitos | COM nono dígito |
-| 31-99 | `55` + DDD + `XXXXXXXX` | 12 dígitos | SEM nono dígito |
+| Formato | Comprimento | Regra |
+|---------|-------------|-------|
+| `55` + DDD + `9XXXXXXXX` | 13 dígitos | COM nono dígito (formato padrão) |
+| `55` + DDD + `XXXXXXXX` | 12 dígitos | SEM nono dígito (formato alternativo para retry) |
 
 ### Função `normalizeBrazilianPhone()`
 
-Presente em: `whatsapp.service.ts`, `webhook.service.ts`, `calling.service.ts`, `voxcall-integration.service.ts`
+Presente em: `whatsapp.service.ts`, `webhook.service.ts`, `calling.service.ts`, `voxcall-integration.service.ts`, `routes.ts`
 
 ```typescript
 function normalizeBrazilianPhone(phone: string): string {
   // 1. Remove não-dígitos e adiciona DDI 55 se necessário
-  // 2. DDDs 11-28: adiciona 9 se tem apenas 8 dígitos locais
-  // 3. DDDs 31-99: remove 9 se tem 9 dígitos locais começando com 9
+  // 2. Se número local tem 8 dígitos e não começa com 0 (fixo): ADICIONA o 9
+  // NUNCA remove o nono dígito — a Meta normaliza do lado deles
 }
 ```
 
 ### Função `getAlternatePhoneNumber()`
 
-Gera o número no formato alternativo (com/sem o 9) para busca de contatos e retry de envio.
+Gera o número no formato alternativo (com/sem o 9) para busca de contatos e retry de envio:
+- Se tem 9 dígitos locais começando com 9 → gera versão SEM o 9 (12 dígitos)
+- Se tem 8 dígitos locais → gera versão COM o 9 (13 dígitos)
 
 ### Retry Automático no Envio (`sendToMeta`)
 
 Se o envio falhar com erro de destinatário (códigos 131026, 100, subcodes 2388055, 1245301, ou mensagem contendo "recipient"), o sistema automaticamente:
-1. Gera o número alternativo (com/sem 9° dígito)
+1. Gera o número alternativo (sem 9° dígito) via `getAlternatePhoneNumber()`
 2. Tenta enviar novamente com o formato alternativo
 3. Se o retry funcionar, retorna sucesso normalmente
 
 ### Busca de Contatos Anti-Duplicação
 
 Na recepção de mensagens (`findOrCreateContact` em `webhook.service.ts`) e chamadas (`calling.service.ts`):
-1. Normaliza o número recebido
+1. Normaliza o número recebido (adiciona 9 se faltando)
 2. Busca no banco por AMBAS as variações (com e sem o 9) usando `{ in: [...] }`
 3. Se encontrar contato com número no formato antigo, atualiza automaticamente para o formato normalizado
 4. Evita criação de contatos duplicados para o mesmo número
@@ -749,8 +751,9 @@ Na recepção de mensagens (`findOrCreateContact` em `webhook.service.ts`) e cha
 
 - A normalização é aplicada em TODOS os pontos de envio (texto, template, mídia, interativo, localização, contato, reação)
 - A normalização NÃO se aplica a números internacionais (sem DDI 55)
-- Números de telefone fixo (8 dígitos sem 9) em DDDs 31-99 são mantidos como estão (12 dígitos)
+- Números de telefone fixo (começam com 0) são mantidos como estão
 - A rota `POST /api/contacts/check-ninth-digit` existe para correção em massa de contatos existentes
+- NUNCA remover o nono dígito na normalização — a Meta aceita ambos os formatos e faz a normalização interna
 
 ## Contatos (Contacts)
 
