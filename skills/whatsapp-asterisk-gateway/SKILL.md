@@ -377,6 +377,77 @@ exten => i,1,Goto(ATENDIMENTO_GERAL,s,1)
 exten => s,1,Dial(PJSIP/ramal1&PJSIP/ramal2,30)
 ```
 
+## Docker Networking — OBRIGATÓRIO para RTP (CRÍTICO)
+
+O gateway RTP abre portas UDP dinâmicas (ex: 46001, 46002...) para comunicação com o Asterisk. Essas portas **NÃO podem estar isoladas** numa rede Docker bridge.
+
+### O Problema
+
+Quando o container app está numa rede Docker bridge (ex: `networks: voxzap-net`) com apenas `expose: ["5000"]`:
+- Porta 5000 TCP funciona normalmente (HTTP/WebSocket)
+- Portas UDP dinâmicas abertas pelo gateway **NÃO são acessíveis externamente**
+- O Asterisk envia RTP para `calling_voxcall_rtp_bind:porta_udp`, mas os pacotes nunca chegam ao container
+- **Sintoma**: WebRTC conecta (ice=connected, dtls=connected), mas `astSilenceMs` cresce indefinidamente (5001, 10001, 15001...) — Asterisk nunca "chega"
+
+### A Solução: `network_mode: host`
+
+O container app **DEVE** usar `network_mode: host` para que as portas UDP fiquem diretamente acessíveis no IP do host:
+
+```yaml
+services:
+  app:
+    build:
+      context: .
+      args:
+        - TZ=America/Sao_Paulo
+    container_name: voxzap-app
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=America/Sao_Paulo
+    volumes:
+      - ./uploads:/app/uploads
+    network_mode: host
+
+  nginx:
+    image: nginx:alpine
+    container_name: voxzap-nginx
+    restart: unless-stopped
+    environment:
+      - TZ=America/Sao_Paulo
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+      - /etc/letsencrypt:/etc/letsencrypt
+      - /var/lib/letsencrypt:/var/lib/letsencrypt
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+```
+
+### Consequências do `network_mode: host`
+
+1. **O container app escuta diretamente no host** — porta 5000 no host, portas UDP no host
+2. **Nginx NÃO pode usar o nome do serviço Docker** (`app`) como proxy target — deve usar `host.docker.internal` (que resolve para o IP do host via `extra_hosts`)
+3. **nginx.conf deve usar**: `proxy_pass http://host.docker.internal:5000;`
+4. **O container app NÃO pode participar de redes Docker** (`networks:` é incompatível com `network_mode: host`)
+5. **DATABASE_URL** deve usar o hostname externo ou `localhost` (não o nome do serviço Docker `db`)
+
+### Verificação
+
+```bash
+docker inspect voxzap-app --format '{{.HostConfig.NetworkMode}}'
+# Deve retornar: host
+
+ss -tuln | grep 5000
+# Deve mostrar: LISTEN 0.0.0.0:5000
+
+# Após uma chamada, verificar que a porta UDP RTP está no host
+ss -uln | grep 460
+# Deve mostrar a porta dinâmica (ex: 46001)
+```
+
 ## Checklist de Implantação por Cliente
 
 ### Pré-requisitos no Asterisk do Cliente
@@ -389,7 +460,13 @@ exten => s,1,Dial(PJSIP/ramal1&PJSIP/ramal2,30)
 - [ ] Dialplan com contexto e extensão para receber chamadas
 - [ ] Firewall: portas RTP UDP (10000-20000) abertas para IP do VoxZap
 
-### Configuração no VoxZap
+### Configuração no VoxZap (Docker)
+
+- [ ] Container app com `network_mode: host` (OBRIGATÓRIO para RTP/UDP)
+- [ ] Nginx com `proxy_pass http://host.docker.internal:5000` (não `http://app:5000`)
+- [ ] Nginx com `extra_hosts: ["host.docker.internal:host-gateway"]`
+
+### Configuração no VoxZap (Settings)
 
 - [ ] Ativar `calling_voxcall_enabled = enabled`
 - [ ] Configurar `calling_voxcall_ari_host` com IP do Asterisk
@@ -414,13 +491,16 @@ exten => s,1,Dial(PJSIP/ramal1&PJSIP/ramal2,30)
 **Diagnóstico:**
 ```bash
 docker logs voxzap-app --since 5m 2>&1 | grep 'VoxCall-GW.*count'
+# Verificar astSilenceMs nos DIAG — se cresce indefinidamente, Asterisk não está enviando RTP
+docker logs voxzap-app --since 5m 2>&1 | grep 'VoxCall-GW.*DIAG'
 ```
 
 **Causas comuns:**
-1. **Firewall bloqueando RTP**: Abrir portas UDP no Asterisk para IP do VoxZap
-2. **`strictrtp = yes`**: Asterisk descarta RTP de IPs desconhecidos. Mudar para `no` ou `comedia`
-3. **`calling_voxcall_rtp_bind` errado**: Deve ser IP pelo qual Asterisk alcança VoxZap
-4. **Asterisk não envia para ExternalMedia**: Verificar se ExternalMedia channel está no bridge
+1. **Container em Docker bridge SEM portas UDP expostas (CAUSA #1 MAIS COMUM)**: O gateway abre portas UDP dinâmicas (ex: 46001, 46002...) para relay RTP. Se o container app está em uma rede Docker bridge (`networks: voxzap-net`) com apenas `expose: ["5000"]`, as portas UDP NÃO são acessíveis externamente. O Asterisk envia RTP para `calling_voxcall_rtp_bind:porta` mas os pacotes nunca chegam ao container. **Solução: usar `network_mode: host`** no container app (ver seção "Docker Networking — OBRIGATÓRIO para RTP")
+2. **Firewall bloqueando RTP**: Abrir portas UDP no Asterisk para IP do VoxZap
+3. **`strictrtp = yes`**: Asterisk descarta RTP de IPs desconhecidos. Mudar para `no` ou `comedia`
+4. **`calling_voxcall_rtp_bind` errado**: Deve ser IP pelo qual Asterisk alcança VoxZap
+5. **Asterisk não envia para ExternalMedia**: Verificar se ExternalMedia channel está no bridge
 
 ### Problema: Áudio picotado/com falhas
 
@@ -550,6 +630,13 @@ if (voxcallConfig) {
 - `astSilenceMs` consistente entre 1-20ms (excelente)
 - ~500 pacotes a cada 10 segundos (50 pps = 20ms/frame)
 - CPU: transcodificação opus é leve com opusscript (WASM)
+
+### Docker Networking e RTP (Incidente Produção)
+- Container em Docker bridge (`networks: voxzap-net`) com apenas `expose: ["5000"]` **bloqueia portas UDP dinâmicas**
+- O gateway abre portas UDP (ex: 46001) via `dgram.createSocket('udp4')` — essas portas ficam acessíveis apenas dentro da rede Docker, NÃO externamente
+- Asterisk envia RTP para `calling_voxcall_rtp_bind:porta_udp` → pacotes nunca chegam ao container → `astSilenceMs` cresce indefinidamente
+- **Solução**: `network_mode: host` no container app — portas UDP ficam diretamente no host
+- **Impacto no nginx**: com `network_mode: host`, nginx não pode usar `http://app:5000` — deve usar `http://host.docker.internal:5000` com `extra_hosts: ["host.docker.internal:host-gateway"]`
 
 ## Referências Cruzadas com Outras Skills
 

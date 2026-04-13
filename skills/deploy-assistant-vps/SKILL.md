@@ -152,6 +152,48 @@ CMD ["npm", "start"]
 - **DB port bound to localhost** — `127.0.0.1:5432:5432` (not exposed externally)
 - **Docker resource isolation** — VoxCALL and Asterisk MUST use completely separate service names, volume names, and network names (see "Docker Resource Isolation" section below)
 
+### 3b. VoxZap with WhatsApp Calling Gateway: `network_mode: host` (CRITICAL)
+When the VoxZap app includes the WhatsApp→Asterisk calling gateway, the app container **MUST** use `network_mode: host` instead of a Docker bridge network.
+
+**WHY:** The calling gateway opens dynamic UDP ports (e.g., 46001, 46002...) for RTP relay between Asterisk and WhatsApp/Meta. In a Docker bridge network with only `expose: ["5000"]`, these UDP ports are NOT accessible externally. Asterisk sends RTP to `calling_voxcall_rtp_bind:port` but packets never reach the container. Symptom: WebRTC connects (ice=connected, dtls=connected) but `astSilenceMs` grows indefinitely — no audio from Asterisk.
+
+**Required docker-compose.yml:**
+```yaml
+services:
+  app:
+    build:
+      context: .
+      args:
+        - TZ=America/Sao_Paulo
+    container_name: voxzap-app
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=America/Sao_Paulo
+    volumes:
+      - ./uploads:/app/uploads
+    network_mode: host
+
+  nginx:
+    image: nginx:alpine
+    container_name: voxzap-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+      - /etc/letsencrypt:/etc/letsencrypt
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+```
+
+**Consequences of `network_mode: host`:**
+- nginx.conf MUST use `proxy_pass http://host.docker.internal:5000;` (NOT `http://app:5000`)
+- nginx container needs `extra_hosts: ["host.docker.internal:host-gateway"]` to resolve `host.docker.internal`
+- The app container cannot use Docker `networks:` (incompatible with `network_mode: host`)
+- DATABASE_URL must use external hostname or `localhost` (not Docker service names like `db`)
+
 ### 4. nginx.conf: String Array Concatenation, NOT Template Literals
 When generating nginx config, use string array `.join('\n')`, NOT ES6 template literals.
 
