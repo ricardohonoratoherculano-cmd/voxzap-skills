@@ -415,11 +415,20 @@ const handleRejectCall = () => {
 - ALLOWED_SETTING_KEYS no routes.ts inclui: calling_bic_template, calling_turn_url, calling_turn_username, calling_turn_credential
 - apiRequest<T> retorna JSON já parseado — NUNCA chamar .json() no resultado
 
-### Fase 3: Recursos Avançados — FUTURO
+### Fase 3: Gateway Asterisk/PBX (VoxCall) — ✅ LIVE-VALIDATED (16+ min call, stable)
+- Roteamento de chamadas WhatsApp para Asterisk via ARI ExternalMedia + werift WebRTC
+- Transcodificação opus@48kHz↔alaw@8kHz com resampling profissional (upsample/downsample 6x)
+- DTMF bidirecional: RFC2833 (telephone-event PT=126) → ARI inject + tons in-band
+- Silence keepalive com contadores compartilhados (sem glitch na transição)
+- Arquivo: `server/services/voxcall-calling-gateway.service.ts`
+- Settings por tenant: calling_voxcall_enabled, calling_voxcall_ari_host, etc.
+- **Ver skill `whatsapp-asterisk-gateway` para arquitetura completa e troubleshooting**
+
+### Fase 4: Recursos Avançados — FUTURO
 - Transferência de chamada entre operadores
 - Gravação de chamadas
 - Histórico e relatórios de chamadas
-- IVR (menu de voz interativo)
+- IVR avançado (menu de voz interativo)
 - Integração com filas de atendimento
 
 ## Arquivos-Chave (Implementados)
@@ -436,12 +445,14 @@ const handleRejectCall = () => {
 | `client/src/pages/documentacao-calling.tsx` | Documentação admin da Calling API |
 | `client/src/App.tsx` | GlobalCallProvider wraps AuthenticatedLayout |
 | `prisma/schema.prisma` | CallLogs table — armazena chamadas e permissões BIC |
+| `server/services/voxcall-calling-gateway.service.ts` | Gateway WhatsApp→Asterisk via ARI ExternalMedia + werift (transcodificação opus↔alaw + DTMF) |
 
 ## Dependências
 
-**NÃO é necessário `wrtc` ou `werift` no backend!**
-O VoxZap usa pattern "signaling relay" — WebRTC roda apenas no navegador (RTCPeerConnection nativo do browser).
-O backend apenas retransmite SDP entre Meta e frontend via Socket.io.
+**Para signaling relay (atendimento direto)**: NÃO é necessário `wrtc` ou `werift` — WebRTC roda apenas no navegador.
+
+**Para gateway Asterisk (VoxCall)**: Usa `werift` (WebRTC server-side) + `opusscript` (codec opus WASM).
+O backend cria RTCPeerConnection server-side para fazer bridge entre Meta WebRTC e Asterisk RTP.
 
 Pacotes já instalados no projeto que são relevantes:
 - `socket.io` / `socket.io-client` — comunicação em tempo real
