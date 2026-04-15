@@ -93,22 +93,21 @@ Cada tenant recebe um **slot numérico** (1, 2, 3...) que define todas as suas p
 | **VoxCALL HTTP** | 5000 + N | 5001 | 5002 | 5003 | 5010 | 127.0.0.1 |
 | **PostgreSQL** | 25432 + N | 25433 | 25434 | 25435 | 25442 | 127.0.0.1 |
 | **SIP (UDP/TCP)** | 5060 + (N×10) | 5070 | 5080 | 5090 | 5160 | 0.0.0.0 |
-| **WSS (WebRTC)** | 8089 + (N×10) | 8099 | 8109 | 8119 | 8189 | 0.0.0.0 |
 | **AMI** | 5038 + N | 5039 | 5040 | 5041 | 5048 | 127.0.0.1 |
-| **ARI HTTP** | 8088 + N | 8089 | 8090 | 8091 | 8098 | 127.0.0.1 |
+| **ARI/WSS HTTP** | 8088 + N | 8089 | 8090 | 8091 | 8098 | 127.0.0.1 |
 | **RTP início** | 10000 + (N×1000) | 11000 | 12000 | 13000 | 20000 | 0.0.0.0 |
 | **RTP fim** | RTP início + 999 | 11999 | 12999 | 13999 | 20999 | 0.0.0.0 |
 
-**WSS (WebSocket Secure):** Porta usada pelo Asterisk para conexões WebRTC (softphone browser). O Nginx do tenant faz proxy reverso da porta WSS, permitindo que clientes WebRTC se conectem via `wss://dominio.com/ws`. A porta WSS direta é opcional — pode ser exposta no firewall para clientes SIP que conectam direto.
+**ARI e WSS compartilham a mesma porta:** O Asterisk tem um único servidor HTTP interno que serve tanto a API REST do ARI (`/ari/...`) quanto WebSocket (`/ws`). A porta ARI_PORT atende ambos, vinculada a `127.0.0.1`. Clientes WebRTC acessam via Nginx proxy reverso (`wss://dominio.com/ws` → `http://127.0.0.1:ARI_PORT/ws`). A API ARI fica protegida por autenticação (user/password) e não é exposta externamente.
 
-**Portas expostas externamente (firewall):** SIP, WSS e RTP. Todas as demais (APP, DB, AMI, ARI) ficam em `127.0.0.1` apenas.
+**Portas expostas externamente (firewall):** Apenas SIP e RTP. Todas as demais (APP, DB, AMI, ARI/WSS) ficam em `127.0.0.1` — o Nginx centralizado faz proxy para o app e para WSS.
 
 ### Limites por Servidor
 
 - **Máximo recomendado**: 20 tenants por servidor dedicado (depende dos recursos)
 - **RTP**: Cada tenant tem 1000 portas RTP (suficiente para ~500 chamadas simultâneas)
 - **Portas reservadas**: Slot 0 é reservado (portas padrão do Asterisk para uso direto se necessário)
-- **Firewall**: Apenas portas SIP e RTP do tenant precisam ser abertas no firewall externo; AMI/ARI ficam em `127.0.0.1`
+- **Firewall**: Apenas portas SIP e RTP precisam ser abertas no firewall externo; AMI/ARI/WSS ficam em `127.0.0.1` (WSS via Nginx proxy)
 
 ### Registro de Tenants (tenant-registry.json)
 
@@ -132,7 +131,6 @@ Cada tenant recebe um **slot numérico** (1, 2, 3...) que define todas as suas p
       "sipPort": 5070,
       "amiPort": 5039,
       "ariPort": 8089,
-      "wssPort": 8099,
       "rtpStart": 11000,
       "rtpEnd": 11999,
       "memoryLimit": "512M",
@@ -148,7 +146,6 @@ Cada tenant recebe um **slot numérico** (1, 2, 3...) que define todas as suas p
       "sipPort": 5080,
       "amiPort": 5040,
       "ariPort": 8090,
-      "wssPort": 8109,
       "rtpStart": 12000,
       "rtpEnd": 12999,
       "memoryLimit": "512M",
@@ -205,7 +202,6 @@ services:
       - ASTERISK_RTP_START=${RTP_START}
       - ASTERISK_RTP_END=${RTP_END}
       - ASTERISK_EXTERNAL_IP=${EXTERNAL_IP}
-      - ASTERISK_WSS_PORT=${WSS_PORT}
       - AMI_PASSWORD=${AMI_PASSWORD}
       - ARI_PASSWORD=${ARI_PASSWORD}
       - DB_HOST=127.0.0.1
@@ -335,7 +331,6 @@ AMI_PORT=5039
 ARI_PORT=8089
 AMI_PASSWORD=ami_SENHA_UNICA_POR_TENANT
 ARI_PASSWORD=ari_SENHA_UNICA_POR_TENANT
-WSS_PORT=8099
 RTP_START=11000
 RTP_END=11999
 EXTERNAL_IP=195.35.19.21
@@ -363,15 +358,14 @@ services:
     image: nginx:alpine
     container_name: mt-nginx
     restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
     volumes:
       - ./conf.d:/etc/nginx/conf.d:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
       - /var/lib/letsencrypt:/var/lib/letsencrypt
     network_mode: host
 ```
+
+**Nota:** `network_mode: host` e `ports:` são mutuamente exclusivos no Docker Compose. Com host networking, o Nginx escuta diretamente nas portas 80/443 do host sem mapeamento.
 
 **`network_mode: host`**: Permite que o Nginx acesse `127.0.0.1:APP_PORT` de cada tenant diretamente, sem precisar de rede Docker compartilhada.
 
@@ -382,7 +376,7 @@ services:
 # limit_req_zone $binary_remote_addr zone=api_limit:10m rate=30r/s;
 # limit_req_zone $binary_remote_addr zone=login_limit:10m rate=5r/m;
 
-# Tenant: acme (slot 1, app porta 5001, WSS porta 8099)
+# Tenant: acme (slot 1, app porta 5001, ARI/WSS porta 8089)
 server {
     listen 80;
     server_name acme.voxcall.cc;
@@ -433,7 +427,7 @@ server {
 
     # WebSocket proxy para Asterisk WSS (WebRTC softphone)
     location /ws {
-        proxy_pass http://127.0.0.1:8099/ws;
+        proxy_pass http://127.0.0.1:8089/ws;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -527,7 +521,6 @@ set -e
 SIP_PORT=${ASTERISK_SIP_PORT:-5060}
 AMI_PORT=${ASTERISK_AMI_PORT:-5038}
 ARI_PORT=${ASTERISK_ARI_PORT:-8088}
-WSS_PORT=${ASTERISK_WSS_PORT:-8089}
 RTP_START=${ASTERISK_RTP_START:-10000}
 RTP_END=${ASTERISK_RTP_END:-10999}
 EXTERNAL_IP=${ASTERISK_EXTERNAL_IP:-}
@@ -546,8 +539,8 @@ EOF
 cat > /etc/asterisk/http.conf <<EOF
 [general]
 enabled=yes
-bindaddr=0.0.0.0
-bindport=${WSS_PORT}
+bindaddr=127.0.0.1
+bindport=${ARI_PORT}
 tlsenable=no
 EOF
 
@@ -630,7 +623,7 @@ local_net=192.168.0.0/16
 [transport-wss]
 type=transport
 protocol=wss
-bind=0.0.0.0:${WSS_PORT}
+bind=127.0.0.1:${ARI_PORT}
 ${EXTERNAL_IP:+external_media_address=${EXTERNAL_IP}}
 ${EXTERNAL_IP:+external_signaling_address=${EXTERNAL_IP}}
 local_net=10.0.0.0/8
@@ -650,7 +643,7 @@ if [ -f /etc/asterisk/custom/extensions_custom.conf ]; then
     echo "#include extensions_custom.conf" >> /etc/asterisk/extensions.conf
 fi
 
-echo "[entrypoint] Asterisk configurado: SIP=${SIP_PORT} WSS=${WSS_PORT} AMI=${AMI_PORT} ARI=${ARI_PORT} RTP=${RTP_START}-${RTP_END}"
+echo "[entrypoint] Asterisk configurado: SIP=${SIP_PORT} ARI/WSS=${ARI_PORT} AMI=${AMI_PORT} RTP=${RTP_START}-${RTP_END}"
 
 exec "$@"
 ```
@@ -701,7 +694,6 @@ DB_PORT=$((25432 + SLOT))
 SIP_PORT=$((5060 + SLOT * 10))
 AMI_PORT=$((5038 + SLOT))
 ARI_PORT=$((8088 + SLOT))
-WSS_PORT=$((8089 + SLOT * 10))
 RTP_START=$((10000 + SLOT * 1000))
 RTP_END=$((RTP_START + 999))
 
@@ -710,7 +702,7 @@ SESSION_SECRET="session_$(openssl rand -hex 16)"
 AMI_PASSWORD="ami_$(openssl rand -hex 12)"
 ARI_PASSWORD="ari_$(openssl rand -hex 12)"
 
-echo "  Portas: APP=$APP_PORT DB=$DB_PORT SIP=$SIP_PORT WSS=$WSS_PORT AMI=$AMI_PORT ARI=$ARI_PORT RTP=$RTP_START-$RTP_END"
+echo "  Portas: APP=$APP_PORT DB=$DB_PORT SIP=$SIP_PORT AMI=$AMI_PORT ARI/WSS=$ARI_PORT RTP=$RTP_START-$RTP_END"
 
 # 1. Criar diretórios
 TENANT_DIR="$TENANTS_DIR/$TENANT_ID"
@@ -760,7 +752,6 @@ AMI_PORT=$AMI_PORT
 ARI_PORT=$ARI_PORT
 AMI_PASSWORD=$AMI_PASSWORD
 ARI_PASSWORD=$ARI_PASSWORD
-WSS_PORT=$WSS_PORT
 RTP_START=$RTP_START
 RTP_END=$RTP_END
 EXTERNAL_IP=$EXTERNAL_IP
@@ -938,7 +929,7 @@ fi
 NGINX_CONF="$TENANTS_DIR/nginx/conf.d/tenant_${TENANT_ID}.conf"
 
 cat > "$NGINX_CONF" <<NGINXCONF
-# Tenant: $TENANT_ID ($DOMAIN) — Slot $SLOT, App porta $APP_PORT, WSS porta $WSS_PORT
+# Tenant: $TENANT_ID ($DOMAIN) — Slot $SLOT, App porta $APP_PORT, ARI/WSS porta $ARI_PORT
 server {
     listen 80;
     server_name $DOMAIN;
@@ -989,7 +980,7 @@ server {
 
     # WebSocket proxy para Asterisk WSS (WebRTC softphone)
     location /ws {
-        proxy_pass http://127.0.0.1:$WSS_PORT/ws;
+        proxy_pass http://127.0.0.1:$ARI_PORT/ws;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \\\$http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -1029,7 +1020,6 @@ r['tenants']['$TENANT_ID'] = {
     'sipPort': $SIP_PORT,
     'amiPort': $AMI_PORT,
     'ariPort': $ARI_PORT,
-    'wssPort': $WSS_PORT,
     'rtpStart': $RTP_START,
     'rtpEnd': $RTP_END,
     'memoryLimit': '512M',
@@ -1066,7 +1056,6 @@ echo "  ARI Password: $ARI_PASSWORD"
 echo ""
 echo "Portas abertas no firewall (se necessário):"
 echo "  SIP: $SIP_PORT/udp,$SIP_PORT/tcp"
-echo "  WSS: $WSS_PORT/tcp"
 echo "  RTP: $RTP_START-$RTP_END/udp"
 ```
 
@@ -1356,22 +1345,22 @@ Cada tenant precisa das seguintes portas abertas no firewall externo:
 open_tenant_ports() {
   local TENANT_ID=$1
   local SIP_PORT=$2
-  local WSS_PORT=$3
-  local RTP_START=$4
-  local RTP_END=$5
+  local RTP_START=$3
+  local RTP_END=$4
 
   ufw allow ${SIP_PORT}/udp comment "SIP ${TENANT_ID}"
   ufw allow ${SIP_PORT}/tcp comment "SIP ${TENANT_ID}"
-  ufw allow ${WSS_PORT}/tcp comment "WSS ${TENANT_ID}"
   ufw allow ${RTP_START}:${RTP_END}/udp comment "RTP ${TENANT_ID}"
 }
 
 # Exemplo: Tenant slot 1
-open_tenant_ports acme 5070 8099 11000 11999
+open_tenant_ports acme 5070 11000 11999
 
 # Exemplo: Tenant slot 2
-open_tenant_ports globex 5080 8109 12000 12999
+open_tenant_ports globex 5080 12000 12999
 ```
+
+**WSS não precisa de porta no firewall:** O Asterisk HTTP (ARI/WSS) é vinculado a `127.0.0.1`. Clientes WebRTC acessam via Nginx HTTPS na porta 443 (`wss://dominio.com/ws` → proxy para `127.0.0.1:ARI_PORT/ws`).
 
 **Portas que NÃO devem ser abertas externamente:**
 - APP_PORT (5001, 5002...) — acessado apenas pelo Nginx local
