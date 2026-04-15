@@ -98,7 +98,13 @@ Cada tenant recebe um **slot numérico** (1, 2, 3...) que define todas as suas p
 | **RTP início** | 10000 + (N×1000) | 11000 | 12000 | 13000 | 20000 | 0.0.0.0 |
 | **RTP fim** | RTP início + 999 | 11999 | 12999 | 13999 | 20999 | 0.0.0.0 |
 
-**ARI e WSS compartilham a mesma porta:** O Asterisk tem um único servidor HTTP interno que serve tanto a API REST do ARI (`/ari/...`) quanto WebSocket (`/ws`). A porta ARI_PORT atende ambos, vinculada a `127.0.0.1`. Clientes WebRTC acessam via Nginx proxy reverso (`wss://dominio.com/ws` → `http://127.0.0.1:ARI_PORT/ws`). A API ARI fica protegida por autenticação (user/password) e não é exposta externamente.
+**ARI e WS compartilham a mesma porta HTTP:** O Asterisk tem um único servidor HTTP interno (`http.conf`, `bindaddr=127.0.0.1`) que serve tanto a API REST do ARI (`/ari/...`) quanto WebSocket SIP para WebRTC (`/ws`). A porta ARI_PORT atende ambos.
+
+**Modelo de TLS (TLS termination no Nginx):**
+- Asterisk roda com `protocol=ws` (plain WebSocket, sem TLS) em `127.0.0.1:ARI_PORT`
+- Nginx termina TLS (certificado Let's Encrypt) na porta 443
+- Clientes WebRTC conectam via `wss://dominio.com/ws` → Nginx faz proxy para `http://127.0.0.1:ARI_PORT/ws`
+- A API ARI fica protegida por autenticação (user/password) e não é exposta externamente
 
 **Portas expostas externamente (firewall):** Apenas SIP e RTP. Todas as demais (APP, DB, AMI, ARI/WSS) ficam em `127.0.0.1` — o Nginx centralizado faz proxy para o app e para WSS.
 
@@ -425,7 +431,7 @@ server {
         proxy_set_header X-Forwarded-Proto https;
     }
 
-    # WebSocket proxy para Asterisk WSS (WebRTC softphone)
+    # WebSocket proxy para Asterisk WS (TLS terminado no Nginx, upstream é WS plain)
     location /ws {
         proxy_pass http://127.0.0.1:8089/ws;
         proxy_http_version 1.1;
@@ -549,7 +555,7 @@ cat > /etc/asterisk/ari.conf <<EOF
 [general]
 enabled=yes
 pretty=yes
-allowed_origins=*
+allowed_origins=http://127.0.0.1
 
 [voxari]
 type=user
@@ -568,8 +574,8 @@ bindaddr=127.0.0.1
 secret=${AMI_PASS}
 deny=0.0.0.0/0.0.0.0
 permit=127.0.0.0/255.0.0.0
-read=all
-write=all
+read=system,call,log,verbose,command,agent,user,config,dtmf,reporting,cdr,dialplan
+write=system,call,command,originate,reporting
 EOF
 
 if [ -n "$DB_PASSWORD" ]; then
@@ -620,9 +626,9 @@ local_net=10.0.0.0/8
 local_net=172.16.0.0/12
 local_net=192.168.0.0/16
 
-[transport-wss]
+[transport-ws]
 type=transport
-protocol=wss
+protocol=ws
 bind=127.0.0.1:${ARI_PORT}
 ${EXTERNAL_IP:+external_media_address=${EXTERNAL_IP}}
 ${EXTERNAL_IP:+external_signaling_address=${EXTERNAL_IP}}
@@ -978,7 +984,7 @@ server {
         proxy_set_header X-Forwarded-Proto https;
     }
 
-    # WebSocket proxy para Asterisk WSS (WebRTC softphone)
+    # WebSocket proxy para Asterisk WS (TLS terminado no Nginx, upstream é WS plain)
     location /ws {
         proxy_pass http://127.0.0.1:$ARI_PORT/ws;
         proxy_http_version 1.1;
@@ -1334,6 +1340,153 @@ printf "║ %-60s ║\n" "Disco: ${DISK_INFO}"
 echo "╚══════════════════════════════════════════════════════════════╝"
 ```
 
+### Integração com Cloud Storage (upload de backups)
+
+Os backups locais devem ser enviados ao Replit Cloud Storage para redundância geográfica. Usar a API REST do VoxCALL (`/api/cloud-storage`) que já implementa o serviço `CloudStorageService`:
+
+```bash
+#!/bin/bash
+# upload-backups-cloud.sh — Envia backups compactados para Cloud Storage
+set -euo pipefail
+
+VOXCALL_API="https://voxtel.voxcall.cc"
+CLOUD_STORAGE_KEY="${CLOUD_STORAGE_KEY:?Defina CLOUD_STORAGE_KEY}"
+BACKUP_BASE="/opt/backups/multi-tenant"
+TIMESTAMP=$(date +%Y%m%d)
+
+for tenant_dir in "$BACKUP_BASE"/*/; do
+  tid=$(basename "$tenant_dir")
+  LATEST=$(ls -1d "$tenant_dir"/backup_* 2>/dev/null | sort | tail -1)
+  [ -z "$LATEST" ] && continue
+
+  ARCHIVE="/tmp/${tid}_backup_${TIMESTAMP}.tar.gz"
+  tar czf "$ARCHIVE" -C "$LATEST" .
+
+  echo "Enviando backup $tid para Cloud Storage..."
+  curl -s -X POST "$VOXCALL_API/api/cloud-storage/upload" \
+    -H "Authorization: Bearer $CLOUD_STORAGE_KEY" \
+    -F "file=@$ARCHIVE" \
+    -F "path=backups/multi-tenant/${tid}/${tid}_${TIMESTAMP}.tar.gz" \
+    && echo "  OK: $tid" \
+    || echo "  ERRO: $tid"
+
+  rm -f "$ARCHIVE"
+done
+
+echo "Upload de backups para Cloud Storage concluído"
+```
+
+**Crontab:** Executar após o backup local (ex: `0 4 * * *`), referenciando o script `upload-backups-cloud.sh`.
+
+### Alertas e Notificações
+
+```bash
+#!/bin/bash
+# alert-check.sh — Verifica thresholds e envia alertas
+set -euo pipefail
+
+TENANTS_DIR="/opt/tenants"
+ALERT_WEBHOOK="${ALERT_WEBHOOK:-}"  # URL do webhook (Slack, Discord, etc.)
+ALERT_EMAIL="${ALERT_EMAIL:-}"       # Email para alertas via sendmail
+ALERT_LOG="/var/log/tenant-alerts.log"
+
+DISK_THRESHOLD=85   # % de uso de disco
+MEM_THRESHOLD=90    # % de uso de RAM
+CPU_THRESHOLD=95    # % de uso de CPU
+
+send_alert() {
+  local LEVEL=$1 SUBJECT=$2 BODY=$3
+  local TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+  echo "[$TIMESTAMP] [$LEVEL] $SUBJECT: $BODY" >> "$ALERT_LOG"
+
+  if [ -n "$ALERT_WEBHOOK" ]; then
+    curl -s -X POST "$ALERT_WEBHOOK" \
+      -H "Content-Type: application/json" \
+      -d "{\"text\":\"[$LEVEL] $SUBJECT\\n$BODY\"}" || true
+  fi
+
+  if [ -n "$ALERT_EMAIL" ]; then
+    echo "$BODY" | mail -s "[$LEVEL] Multi-Tenant Alert: $SUBJECT" "$ALERT_EMAIL" 2>/dev/null || true
+  fi
+}
+
+# Verificar cada tenant
+for dir in "$TENANTS_DIR"/*/; do
+  tid=$(basename "$dir")
+  [ "$tid" = "nginx" ] || [ "$tid" = "_shared" ] && continue
+  [ -f "$dir/docker-compose.yml" ] || continue
+
+  for container in "${tid}-app" "${tid}-asterisk" "${tid}-db"; do
+    STATUS=$(docker inspect --format='{{.State.Status}}' "$container" 2>/dev/null || echo "not_found")
+    if [ "$STATUS" != "running" ]; then
+      send_alert "CRITICAL" "Container down: $container" "Status: $STATUS. Tentando restart..."
+      docker start "$container" 2>/dev/null || true
+    fi
+  done
+done
+
+# Verificar recursos do servidor
+DISK_USAGE=$(df / | awk 'NR==2{print int($5)}')
+MEM_USAGE=$(free | awk '/Mem:/{printf "%.0f", $3/$2*100}')
+CPU_USAGE=$(top -bn1 | grep "Cpu(s)" | awk '{printf "%.0f", $2+$4}')
+
+[ "$DISK_USAGE" -ge "$DISK_THRESHOLD" ] && \
+  send_alert "WARNING" "Disco alto" "Uso: ${DISK_USAGE}% (threshold: ${DISK_THRESHOLD}%)"
+
+[ "$MEM_USAGE" -ge "$MEM_THRESHOLD" ] && \
+  send_alert "WARNING" "Memória alta" "Uso: ${MEM_USAGE}% (threshold: ${MEM_THRESHOLD}%)"
+
+[ "$CPU_USAGE" -ge "$CPU_THRESHOLD" ] && \
+  send_alert "WARNING" "CPU alta" "Uso: ${CPU_USAGE}% (threshold: ${CPU_THRESHOLD}%)"
+```
+
+**Crontab de alertas:**
+```cron
+# Verificação de saúde a cada 5 minutos
+*/5 * * * * /opt/tenants/_shared/alert-check.sh 2>&1
+```
+
+### Logging Centralizado
+
+Consolidar logs de todos os tenants em um diretório central com rotação:
+
+```bash
+# /etc/logrotate.d/multi-tenant
+/var/log/tenant-*.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    create 0644 root root
+}
+
+# Coletar logs de cada tenant:
+# docker logs --since 24h ${tid}-app >> /var/log/tenant-${tid}-app.log
+# docker logs --since 24h ${tid}-asterisk >> /var/log/tenant-${tid}-asterisk.log
+```
+
+**Script de coleta de logs:**
+```bash
+#!/bin/bash
+# collect-logs.sh — Centraliza logs de todos os tenants
+TENANTS_DIR="/opt/tenants"
+LOG_DIR="/var/log/multi-tenant"
+mkdir -p "$LOG_DIR"
+
+for dir in "$TENANTS_DIR"/*/; do
+  tid=$(basename "$dir")
+  [ "$tid" = "nginx" ] || [ "$tid" = "_shared" ] && continue
+  [ -f "$dir/docker-compose.yml" ] || continue
+
+  for svc in app asterisk db; do
+    docker logs --since 24h "${tid}-${svc}" >> "$LOG_DIR/${tid}-${svc}.log" 2>&1 || true
+  done
+done
+```
+
+**Crontab:** `0 * * * * /opt/tenants/_shared/collect-logs.sh` (coleta horária).
+
 ---
 
 ## 11. Firewall (UFW/iptables)
@@ -1360,7 +1513,7 @@ open_tenant_ports acme 5070 11000 11999
 open_tenant_ports globex 5080 12000 12999
 ```
 
-**WSS não precisa de porta no firewall:** O Asterisk HTTP (ARI/WSS) é vinculado a `127.0.0.1`. Clientes WebRTC acessam via Nginx HTTPS na porta 443 (`wss://dominio.com/ws` → proxy para `127.0.0.1:ARI_PORT/ws`).
+**ARI/WS não precisa de porta no firewall:** O Asterisk HTTP (ARI + WS) é vinculado a `127.0.0.1`. Clientes WebRTC acessam via Nginx HTTPS na porta 443 (`wss://dominio.com/ws` → Nginx termina TLS → proxy para `http://127.0.0.1:ARI_PORT/ws`).
 
 **Portas que NÃO devem ser abertas externamente:**
 - APP_PORT (5001, 5002...) — acessado apenas pelo Nginx local
@@ -1452,3 +1605,22 @@ docker compose ps
 - Monitorar: `./monitor-all.sh`
 - Ajustar limites no `.env` do tenant
 - Considerar migrar tenants para outro servidor
+
+---
+
+## 15. Publicação e Sincronização
+
+Esta skill é sincronizada com o repositório central de skills via `sync-skills.sh`:
+
+```bash
+# Publicar alterações desta skill para o repositório central
+./sync-skills.sh push
+
+# Baixar atualizações do repositório central
+./sync-skills.sh pull
+```
+
+**Repositório:** `github.com/ricardohonoratoherculano-cmd/voxzap-skills`
+**Caminho no repo:** `skills/multi-tenant-server/SKILL.md`
+
+Ao modificar esta skill, sempre executar `sync-skills.sh push` para manter o repositório central atualizado. Para detalhes sobre o sistema de sincronização, consultar a skill `skills-sync`.
