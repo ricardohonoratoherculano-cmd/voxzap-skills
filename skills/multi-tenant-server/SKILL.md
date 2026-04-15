@@ -1052,18 +1052,30 @@ echo "     certbot certonly --webroot -w /var/lib/letsencrypt -d $DOMAIN --agree
 echo "  6. Reload Nginx:"
 echo "     docker exec mt-nginx nginx -t && docker exec mt-nginx nginx -s reload"
 echo ""
-echo "Credenciais:"
+CRED_FILE="$TENANT_DIR/.credentials"
+cat > "$CRED_FILE" <<CRED
+# Credenciais do tenant $TENANT_ID — ARQUIVO CONFIDENCIAL
+# Gerado em: $(date '+%Y-%m-%d %H:%M:%S')
+URL=https://$DOMAIN
+ADMIN_USER=superadmin
+ADMIN_PASSWORD=$ADMIN_PASSWORD
+ADMIN_EMAIL=$ADMIN_EMAIL
+DB_PASSWORD=$DB_PASSWORD
+AMI_PASSWORD=$AMI_PASSWORD
+ARI_PASSWORD=$ARI_PASSWORD
+CRED
+chmod 600 "$CRED_FILE"
+
+echo "Credenciais salvas em: $CRED_FILE (chmod 600)"
 echo "  URL: https://$DOMAIN"
-echo "  Admin: superadmin / $ADMIN_PASSWORD"
-echo "  Email: $ADMIN_EMAIL"
-echo "  DB Password: $DB_PASSWORD"
-echo "  AMI Password: $AMI_PASSWORD"
-echo "  ARI Password: $ARI_PASSWORD"
+echo "  Admin: superadmin"
 echo ""
 echo "Portas abertas no firewall (se necessário):"
 echo "  SIP: $SIP_PORT/udp,$SIP_PORT/tcp"
 echo "  RTP: $RTP_START-$RTP_END/udp"
 ```
+
+**Higiene de credenciais:** O script salva credenciais em arquivo separado (`chmod 600`) em vez de imprimir senhas no stdout. Nunca redirecionar a saída do provisionamento para logs compartilhados. Rotacionar credenciais periodicamente via `docker exec <id>-app` para atualizar senhas no banco.
 
 ---
 
@@ -1622,5 +1634,6 @@ Esta skill é sincronizada com o repositório central de skills via `sync-skills
 
 **Repositório:** `github.com/ricardohonoratoherculano-cmd/voxzap-skills`
 **Caminho no repo:** `skills/multi-tenant-server/SKILL.md`
+**Último push:** commit `5865a0c040b4bc6e20d534de1bcb6ea99fe192ad` (v4 — WS/TLS, Cloud Storage, alerting, hardened)
 
 Ao modificar esta skill, sempre executar `sync-skills.sh push` para manter o repositório central atualizado. Para detalhes sobre o sistema de sincronização, consultar a skill `skills-sync`.
