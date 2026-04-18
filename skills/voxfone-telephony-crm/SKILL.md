@@ -953,7 +953,7 @@ exten => h,3,Set(OPERADOR_DATAHORA()=${MEMBERNAME})
 - Chamadas originadas via AMI → geram eventos queue_log (ENTERQUEUE, CONNECT, COMPLETE) → triggers VPS preenchem `t_monitor_voxcall` + `dialer_queue_log` + `dialer_agent_performance` automaticamente
 - `monitor_operador` consultado para verificar disponibilidade de operadores
 - Relatório de Operadores do Discador usa `dialer_agent_performance` (primário) ou `dialer_queue_log` (fallback) — NÃO usa AMI
-- O campo `canal` em `t_monitor_voxcall` fica vazio para chamadas do discador enquanto o CEL não estiver ativado no Asterisk
+- O campo `canal` em `t_monitor_voxcall` é populado pela trigger `monitor_voxcall()` no CONNECT, que lê de `canal_chamada` (alimentada pela trigger CEL `fn_cel_captura_canal` em CHAN_START). Ver seção "Habilitar CEL para captura de canal externo" na skill `asterisk-callcenter-expert` para os configs `cel.conf` / `cel_pgsql.conf` que habilitam o pipeline.
 
 **API endpoints** (role: administrator/superadmin):
 | Method | Endpoint | Description |
@@ -977,7 +977,15 @@ exten => h,3,Set(OPERADOR_DATAHORA()=${MEMBERNAME})
 - UNIQUE index faltando em `relatorio_operador(data, operador, fila)` na VPS — causava ROLLBACK de toda a cascade de triggers
 - Relatório de Operadores: removida captura AMI (operatorRamal/operatorName), substituída por trigger PostgreSQL `trg_dialer_agent_performance`
 
-**CEL pendente**: O campo `canal` de `t_monitor_voxcall` depende da tabela `canal_chamada`, preenchida pela trigger `fn_cel_captura_canal` no CEL. O CEL está desativado no Asterisk (ver asterisk-callcenter-expert skill para detalhes de ativação).
+**Pipeline CEL → canal_chamada → t_monitor_voxcall.canal**:
+- Tabela `cel` no PG do extdb DEVE ser `UNLOGGED` (a trigger BEFORE INSERT `trg_cel_captura_canal` retorna NULL, então `cel` nunca cresce — armazenamento zero). Validar com:
+  ```sql
+  SELECT relpersistence FROM pg_class WHERE relname='cel';  -- deve retornar 'u' (UNLOGGED)
+  ```
+- Se `cel` estiver como `'p'` (PERMANENT), fazer `DROP TABLE cel CASCADE` e recriar conforme `server/asterisk-schema.sql:984-1006` + reaplicar a trigger `trg_cel_captura_canal`.
+- Configurar `cel.conf` + backend (`cel_pgsql.conf` ou `cel_odbc.conf`) no Asterisk apontando para o mesmo PG do extdb. Ver skill `asterisk-callcenter-expert` seção "Habilitar CEL para captura de canal externo".
+
+**Lookup de protocolo no CONNECT (corrigido 2026-04-18)**: A função `monitor_voxcall()` busca protocolo em `protocolo` table. A tabela pode ter 2 rows com mesmo `callid`: um placeholder vazio + o valor real `DDMMYYYYHHMMSS` gerado por `fn_auto_queueid_protocolo`. O SELECT precisa filtrar `protocolo IS NOT NULL AND protocolo <> ''` com `ORDER BY protocolo DESC LIMIT 1` para garantir que pega o não-vazio. Ver `server/asterisk-schema.sql:407-413`.
 
 ### Report UI Conventions
 - Headers: `bg-blue-700` (group row), `bg-blue-600` (column row), white text

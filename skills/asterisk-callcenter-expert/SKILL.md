@@ -811,14 +811,79 @@ O discador preditivo está **implementado e funcional**. Arquivo principal: `ser
 - VPS trigger `fn_atualiza_relatorio_operador`: faltava UNIQUE index em `relatorio_operador(data, operador, fila)` — causava ROLLBACK de toda a cascade de triggers, impedindo gravação do CONNECT
 - Relatório de Operadores: removida captura AMI (operatorRamal/operatorName do InFlightCall), substituída por trigger PostgreSQL `trg_dialer_agent_performance` para dados consistentes
 
-**CEL / canal_chamada (pendente)**:
-- A tabela `cel` existe como UNLOGGED no VPS, com trigger `fn_cel_captura_canal` que captura CHAN_START → `canal_chamada`
-- CEL está **desativado** no Asterisk (`cel.conf` com `enable=yes` comentado)
-- Backend ODBC do CEL (`cel_odbc.conf`) sem configuração ativa
-- O módulo `cel_odbc.so` está carregado no Asterisk mas o CEL core precisa de restart completo para ativar
-- ODBC DSN `asterisk-connector` funciona (localhost:25432, mesmo do CDR)
-- Para ativar: configurar `cel.conf` (enable=yes, events=CHAN_START) e `cel_odbc.conf` (connection=asterisk, table=cel), depois restart do Asterisk
-- O campo `canal` em `t_monitor_voxcall` fica vazio até o CEL ser ativado
+### Habilitar CEL para captura de canal externo
+
+O campo `t_monitor_voxcall.canal` (canal SIP do tronco externo, ex: `SIP/187.72.45.132-000018ef`) só é preenchido quando o pipeline CEL está ativo:
+
+```
+Asterisk CEL (CHAN_START) → INSERT em cel (UNLOGGED) → trigger trg_cel_captura_canal
+   → INSERT em canal_chamada (linkedid, canal) → trigger monitor_voxcall() lê no CONNECT
+   → UPDATE t_monitor_voxcall.canal
+```
+
+**Pré-requisitos no PostgreSQL do extdb (já no schema bootstrap):**
+- Tabela `cel` deve ser **UNLOGGED** (não PERMANENT). Validar:
+  ```sql
+  SELECT relpersistence FROM pg_class WHERE relname='cel';  -- deve ser 'u'
+  ```
+  Se estiver `'p'`, fazer `DROP TABLE cel CASCADE` e recriar conforme `server/asterisk-schema.sql:984-1006`, depois reaplicar `trg_cel_captura_canal`.
+- Trigger `trg_cel_captura_canal` (BEFORE INSERT) + função `fn_cel_captura_canal()` que retorna NULL.
+- Tabela `canal_chamada(linkedid PK, canal, created_at)` + trigger de cleanup `trg_canal_chamada_cleanup` (24h).
+
+**Smoke test do pipeline DB:**
+```sql
+INSERT INTO cel (eventtype, channame, linkedid)
+VALUES ('CHAN_START', 'SIP/test-trunk-99999', 'smoke_test_001');
+SELECT 'cel' AS tbl, COUNT(*) FROM cel WHERE linkedid='smoke_test_001'      -- esperado 0 (cancelado)
+UNION ALL SELECT 'canal_chamada', COUNT(*) FROM canal_chamada WHERE linkedid='smoke_test_001';  -- esperado 1
+DELETE FROM canal_chamada WHERE linkedid='smoke_test_001';
+```
+
+**Configuração no Asterisk:**
+
+`/etc/asterisk/cel.conf`:
+```ini
+[general]
+enable=yes
+apps=all
+events=CHAN_START
+
+[manager]
+enabled=yes
+```
+
+`/etc/asterisk/cel_pgsql.conf` (preferir `cel_pgsql` por ser conexão direta, sem ODBC):
+```ini
+[global]
+hostname=<host_do_extdb>
+port=<porta_do_extdb>
+dbname=asterisk
+user=asterisk
+password=<senha>
+table=cel
+```
+
+Alternativa via ODBC (`cel_odbc.conf` + DSN `asterisk-connector` em `res_odbc.conf`):
+```ini
+[asterisk]
+connection=asterisk
+table=cel
+usegmtime=no
+allowleapsecond=no
+```
+
+**Reload e validação:**
+```bash
+asterisk -rx "module reload cel.so"
+asterisk -rx "module reload cel_pgsql.so"   # ou cel_odbc.so
+asterisk -rx "cel show status"
+
+# Após uma chamada nova:
+psql -c "SELECT COUNT(*) FROM canal_chamada WHERE created_at > now() - interval '5 min';"
+# Esperado: > 0
+```
+
+**Lookup de protocolo (corrigido 2026-04-18)**: A tabela `protocolo` pode ter 2 rows com o mesmo `callid` (placeholder vazio + valor real `DDMMYYYYHHMMSS`). A função `monitor_voxcall()` precisa filtrar `protocolo IS NOT NULL AND protocolo <> ''` com `ORDER BY protocolo DESC LIMIT 1`. Ver `server/asterisk-schema.sql:407-413`.
 
 ### Dados Disponíveis na `retorno_historico`
 
