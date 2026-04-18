@@ -841,6 +841,21 @@ DELETE FROM canal_chamada WHERE linkedid='smoke_test_001';
 
 **Configuração no Asterisk:**
 
+> **IMPORTANTE — Asterisk 11 antigo (CentOS 7, instalações via SVN/source pré-2022):** o `cel_pgsql.so` pode não estar compilado mesmo que o source exista. Verificar com `ls /usr/lib*/asterisk/modules/ | grep cel_`. Se ausente, compilar manualmente:
+> ```bash
+> # Pré-req: yum install postgresql-devel  (já costuma estar instalado se cdr_pgsql funciona)
+> cd /usr/src/asterisk-<versão>
+> cp menuselect.makeopts menuselect.makeopts.bak
+> sed -i 's/\bcel_pgsql\b//' menuselect.makeopts   # remove da lista de excluídos
+> make cel                                          # compila apenas os módulos cel/
+> cp cel/cel_pgsql.so /usr/lib64/asterisk/modules/  # ou /usr/lib/asterisk/modules/
+> cp menuselect.makeopts.bak menuselect.makeopts    # restaura
+> asterisk -rx 'module load cel_pgsql.so'
+> asterisk -rx 'core reload'                        # relê cel.conf
+> asterisk -rx 'cel show status'                    # deve mostrar "Enabled" + "CEL PGSQL backend"
+> ```
+> Caso não tenha source, alternativas: instalar pacote (`yum search asterisk-cel`) ou usar `cel_manager.so` (eventos AMI, requer listener custom).
+
 `/etc/asterisk/cel.conf`:
 ```ini
 [general]
