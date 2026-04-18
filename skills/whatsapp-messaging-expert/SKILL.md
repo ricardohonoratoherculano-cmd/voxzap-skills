@@ -329,55 +329,6 @@ POST /api/webhook/whatsapp  →  Processamento de eventos
 // Comparação: crypto.timingSafeEqual
 ```
 
-#### Resolução do App Secret (resolveAppSecretFromPayload)
-
-O webhook resolve o App Secret dinamicamente por tenant:
-1. Extrai `phoneNumberId` do payload (`metadata.phone_number_id`)
-2. Busca a conexão `Whatsapps` pelo `tokenAPI = phoneNumberId`
-3. Busca o tenant pela conexão → campo `Tenants.metaToken`
-4. Se `metaToken` está configurado (não-vazio e diferente do padrão) → usa como App Secret
-5. Se não → fallback para `process.env.META_APP_SECRET` → se não existe → `null` (validation skipped)
-
-**Valor padrão (skip):** Definido como `META_TOKEN_DEFAULT` no código. Consulte o scratchpad do agente para o valor real.
-
-Função `isAppSecretConfigured(metaToken)` retorna `false` se:
-- metaToken é null/vazio
-- metaToken é igual ao `META_TOKEN_DEFAULT` acima
-
-#### TROUBLESHOOTING: "Invalid signature, rejecting payload"
-
-**Causa mais comum:** O campo `Tenants.metaToken` foi preenchido com um valor que NÃO corresponde ao App Secret real da aplicação Meta. Quando `isAppSecretConfigured()` retorna `true`, a validação HMAC-SHA256 é ativada e todos os webhooks falham com 403.
-
-**Sintoma:** TODAS as mensagens recebidas param de funcionar. Logs mostram:
-```
-[Webhook] POST received, entries=1
-[Webhook] Invalid signature, rejecting payload
-POST /api/webhook/whatsapp 403
-```
-
-**Diagnóstico:**
-```sql
-SELECT id, name, "metaToken" FROM "Tenants" WHERE id = 1;
-```
-
-**Correção imediata (desbloqueia webhooks):**
-```sql
-UPDATE "Tenants" SET "metaToken" = '<META_TOKEN_DEFAULT_FROM_SCRATCHPAD>' WHERE id = 1;
-```
-Isso reseta para o valor padrão, fazendo `isAppSecretConfigured()` retornar `false` e pular a validação.
-
-**Correção definitiva:** Obter o App Secret correto no Meta for Developers → App Settings → Basic → App Secret, e configurar no painel Webhook do VoxZap.
-
-#### rawBody Capture
-
-O `rawBody` é capturado em `server/index.ts` via `express.json({ verify })`:
-```typescript
-app.use(express.json({
-  verify: (req, _res, buf) => { req.rawBody = buf; },
-}));
-```
-O webhook usa `req.rawBody` (Buffer original) para validar a assinatura. Se `rawBody` não existe, faz fallback para `JSON.stringify(req.body)` — que pode diferir do payload original e causar falha de validação.
-
 ### Fluxo de Processamento
 
 ```
@@ -402,26 +353,13 @@ Webhook POST
           │   ├── Se inválido: incrementa tentativas, envia mensagem progressiva
           │   ├── Envia mensagem de confirmação (rating.message)
           │   └── Se já avaliou: envia ratingStoreAttemp
-          ├── ** Routing Chain (determina fila + shouldActivateBot) **
-          │   ├── 1. Force Wallet: walletUserId direto (se configurado)
-          │   ├── 2. Campaign Routing: CampaignContacts com responseRouting (janela 48h)
-          │   │   └── Se match: campaignRouted=true, walletQueueId = campaign.queueId
-          │   ├── 3. Tag Routing (SEMPRE roda, mesmo com campaign/wallet):
-          │   │   ├── Busca ContactTags → TagQueueRoutes (ativas, priority DESC)
-          │   │   ├── Se !walletUserId && !campaignRouted: routing completo (tagRouted=true, define fila)
-          │   │   └── Se já roteado E tag.skipBot=true: tagSkipBotOnly=true (mantém fila, desativa bot)
-          │   ├── 4. VoxCall Routing: busca por número na VoxCall
-          │   └── 5. Default: fila padrão da conexão + bot ativo
           ├── Encontra/cria Ticket (status pending)
-          │   └── queueId definido pela Routing Chain acima
+          │   └── Auto-atribui queueId da conexão WhatsApp
           ├── Extrai conteúdo (extractMessageContent)
           ├── Salva mensagem no banco
           ├── Atualiza lastMessage do ticket
           ├── Broadcast via Socket.io: NEW_MESSAGE + TICKET_UPDATE
-          ├── ** shouldActivateBot check **
-          │   ├── Se (tagRouted && tagRoutedSkipBot) || tagSkipBotOnly → shouldActivateBot=false
-          │   └── Se connection.aiAgentId → shouldActivateBot=true (default)
-          └── ** AI Agent Processing (se shouldActivateBot=true + ticket pending) **
+          └── ** AI Agent Processing (se ticket pending + connection.aiAgentId) **
               ├── Re-lê ticket do banco (freshTicket) para checar lastCallChatbot
               ├── Se lastCallChatbot === false: SKIP (bot desativado após transferência)
               ├── Auto-reply loop detection: se últimas 3 msgs incoming idênticas → desativa bot
@@ -439,18 +377,6 @@ Webhook POST
               │   └── Se transferred: tryTransfer() já cuida de tudo (BH check, status, queueId)
               └── tryTransfer(): businessHoursCheck → transfere se aberto, mensagem de fechamento se fechado (SEMPRE informa o cliente)
 ```
-
-### Proteção contra Tickets Duplicados (Race Condition)
-
-A Meta pode enviar múltiplos webhooks simultaneamente (mesmo messageId 2x, ou mensagens diferentes do mesmo contato no mesmo instante). Sem proteção, `findOrCreateTicket` cria tickets duplicados.
-
-**3 camadas de proteção em `webhook.service.ts`:**
-
-1. **Deduplicação em memória por messageId** (`recentMessageIds: Set`): Cada messageId é marcado por 30s. Se a Meta envia o mesmo webhook 2x, o segundo é descartado antes de qualquer query ao banco. Log: `"already being processed (in-memory dedup), skipping"`
-2. **Mutex por contato** (`contactTicketLocks: Map`): Lock em memória por `tenantId:contactId`. Quando 2 mensagens diferentes do mesmo contato chegam simultaneamente, a segunda espera a primeira criar o ticket. Garante serialização do `findOrCreateTicket` por contato.
-3. **Índice parcial único no banco** (`idx_tickets_one_open_per_contact`): `UNIQUE INDEX ON "Tickets" ("contactId", "tenantId", COALESCE("whatsappId", 0)) WHERE status IN ('open','pending','paused')`. Se as camadas 1 e 2 falharem (restart, multi-instância), o PostgreSQL rejeita a criação. O código trata `P2002` fazendo fallback para buscar o ticket existente.
-
-**IMPORTANTE para migração**: O índice é parcial (só tickets ativos). Tickets `closed` (dados históricos) não são afetados — migrações podem importar múltiplos tickets fechados do mesmo contato sem conflito.
 
 ### Proteção contra Loop Infinito de Auto-Reply
 
@@ -707,76 +633,50 @@ model TicketEvaluations {
 
 ### Regra do 9° Dígito
 
-Todos os celulares brasileiros usam o nono dígito (9) desde Nov/2016 em todos os DDDs. A Meta Cloud API aceita ambos os formatos e normaliza internamente. O sistema sempre envia COM o nono dígito para garantir entrega.
+Todos os DDDs do Brasil já implementaram o nono dígito para celulares (desde Nov/2016). Porém, a API do WhatsApp da Meta tem comportamento diferente por região:
 
-| Formato | Comprimento | Regra |
-|---------|-------------|-------|
-| `55` + DDD + `9XXXXXXXX` | 13 dígitos | COM nono dígito (formato padrão) |
-| `55` + DDD + `XXXXXXXX` | 12 dígitos | SEM nono dígito (formato alternativo para retry) |
+| DDD | Formato WhatsApp API | Comprimento Total | Regra |
+|-----|---------------------|-------------------|-------|
+| 11-28 | `55` + DDD + `9XXXXXXXX` | 13 dígitos | COM nono dígito |
+| 31-99 | `55` + DDD + `XXXXXXXX` | 12 dígitos | SEM nono dígito |
 
 ### Função `normalizeBrazilianPhone()`
 
-Centralizada em: `server/lib/phone-utils.ts` (importada por todos os serviços)
+Presente em: `whatsapp.service.ts`, `webhook.service.ts`, `calling.service.ts`, `voxcall-integration.service.ts`
 
 ```typescript
 function normalizeBrazilianPhone(phone: string): string {
-  // 1. Remove não-dígitos e adiciona DDI 55 se necessário (10 ou 11 dígitos → 55 + número)
-  // 2. Se número local tem 8 dígitos e não começa com 0 (fixo): ADICIONA o 9
-  // NUNCA remove o nono dígito — a Meta normaliza do lado deles
+  // 1. Remove não-dígitos e adiciona DDI 55 se necessário
+  // 2. DDDs 11-28: adiciona 9 se tem apenas 8 dígitos locais
+  // 3. DDDs 31-99: remove 9 se tem 9 dígitos locais começando com 9
 }
 ```
 
 ### Função `getAlternatePhoneNumber()`
 
-Gera o número no formato alternativo (com/sem o 9) para busca de contatos e retry de envio:
-- Se tem 9 dígitos locais começando com 9 → gera versão SEM o 9 (12 dígitos)
-- Se tem 8 dígitos locais → gera versão COM o 9 (13 dígitos)
-
-### Função `buildPhoneSearchNumbers()`
-
-Centralizada em: `server/lib/phone-utils.ts`. Gera TODAS as variantes de busca para um número de telefone, garantindo match com contatos armazenados em qualquer formato (legado ou normalizado).
-
-Para o número `5585976020655`, gera:
-1. `5585976020655` — normalizado completo (13 dígitos)
-2. `558576020655` — sem nono dígito (12 dígitos)
-3. `85976020655` — sem DDI, com nono dígito (11 dígitos)
-4. `8576020655` — sem DDI, sem nono dígito (10 dígitos)
-5. O número raw original (se diferente dos acima)
-
-**Isso é essencial para contatos migrados (ex: Locktec) que podem estar armazenados sem o DDI `55`.** Sem essas variantes sem DDI, o webhook não encontra o contato existente e cria um duplicado, causando tickets duplicados.
+Gera o número no formato alternativo (com/sem o 9) para busca de contatos e retry de envio.
 
 ### Retry Automático no Envio (`sendToMeta`)
 
 Se o envio falhar com erro de destinatário (códigos 131026, 100, subcodes 2388055, 1245301, ou mensagem contendo "recipient"), o sistema automaticamente:
-1. Gera o número alternativo (sem 9° dígito) via `getAlternatePhoneNumber()`
+1. Gera o número alternativo (com/sem 9° dígito)
 2. Tenta enviar novamente com o formato alternativo
 3. Se o retry funcionar, retorna sucesso normalmente
 
 ### Busca de Contatos Anti-Duplicação
 
 Na recepção de mensagens (`findOrCreateContact` em `webhook.service.ts`) e chamadas (`calling.service.ts`):
-1. Normaliza o número recebido via `normalizeBrazilianPhone()`
-2. Gera todas as variantes via `buildPhoneSearchNumbers()` (com/sem DDI, com/sem nono dígito)
-3. Busca no banco por TODAS as variações usando `{ in: searchNumbers }`
-4. Se encontrar contato com número no formato antigo, atualiza automaticamente para o formato normalizado
-5. Evita criação de contatos duplicados para o mesmo número
-
-### Auto-Normalização na Nova Conversa
-
-O endpoint `POST /api/new-conversation`, quando recebe um `contactId` de contato existente:
-1. Verifica se o número do contato está normalizado
-2. Se não estiver (ex: sem DDI `55`), normaliza automaticamente
-3. Verifica conflito antes de atualizar (proteção anti-duplicata com check Prisma P2002)
-4. Log: `[NewConversation] Auto-normalizing contact X number from Y to Z`
+1. Normaliza o número recebido
+2. Busca no banco por AMBAS as variações (com e sem o 9) usando `{ in: [...] }`
+3. Se encontrar contato com número no formato antigo, atualiza automaticamente para o formato normalizado
+4. Evita criação de contatos duplicados para o mesmo número
 
 ### IMPORTANTE
 
 - A normalização é aplicada em TODOS os pontos de envio (texto, template, mídia, interativo, localização, contato, reação)
 - A normalização NÃO se aplica a números internacionais (sem DDI 55)
-- Números de telefone fixo (começam com 0) são mantidos como estão
+- Números de telefone fixo (8 dígitos sem 9) em DDDs 31-99 são mantidos como estão (12 dígitos)
 - A rota `POST /api/contacts/check-ninth-digit` existe para correção em massa de contatos existentes
-- NUNCA remover o nono dígito na normalização — a Meta aceita ambos os formatos e faz a normalização interna
-- `buildPhoneSearchNumbers()` DEVE gerar variantes sem DDI para compatibilidade com dados migrados de sistemas legados
 
 ## Contatos (Contacts)
 
@@ -924,35 +824,18 @@ Contatos com tags específicas são automaticamente direcionados para filas mape
 | `DELETE /api/tag-queue-routes/:id` | Remove mapeamento com validação tenant |
 
 **Fluxo no webhook (`findOrCreateTicket`):**
-
-A verificação de tags roda **SEMPRE**, independente de campaign/wallet routing:
-
-1. Busca tags do contato via `ContactTags`
-2. Verifica `TagQueueRoutes` ativas para essas tags (filtra tag/queue ativas, ordenadas por `priority DESC`)
-3. **Se NÃO há campaign/wallet routing:** tag routing completo — define `tagRouted=true`, `walletQueueId`, `tagRoutedSkipBot`, e `tagRoutedGreeting`
-4. **Se JÁ há campaign/wallet routing E a tag tem `skipBot=true`:** ativa `tagSkipBotOnly=true` — mantém a fila da campanha/wallet mas desativa o bot
-5. Na decisão de ativar bot: `if ((tagRouted && tagRoutedSkipBot) || tagSkipBotOnly)` → `shouldActivateBot = false`
-
-**Variáveis chave:**
-- `tagRouted` — tag routing completo (sem campaign/wallet)
-- `tagSkipBotOnly` — tag override de skipBot quando campaign/wallet já roteou (CRÍTICO: não substitui a fila, apenas desativa o bot)
-- `tagRoutedSkipBot` — valor do campo `skipBot` da TagQueueRoute encontrada
-- `tagRoutedGreeting` — mensagem de saudação da rota (só enviada em tag routing completo)
-
-**Logs de diagnóstico:**
-- `[Webhook] Tag routing: contact X has tag "Y" -> queue "Z" (id=N, skipBot=B, priority=P)` — routing completo
-- `[Webhook] Tag routing skipBot: contact X has tag "Y" with skipBot=true (campaign/wallet routed, applying skipBot only)` — apenas skipBot
-- `[Webhook] Bot skipped due to tag routing for contact X` — bot efetivamente desativado
-- `[Webhook] Bot skipped due to tag routing for contact X (skipBot only, queue from other source)` — bot desativado, fila veio da campanha/wallet
+1. Após wallet routing check, se `walletUserId` não foi atribuído:
+2. Busca tags do contato via `ContactTags`
+3. Verifica `TagQueueRoutes` ativas para essas tags (filtra tag/queue ativas)
+4. Se encontrar match: sobrescreve `walletQueueId` com a fila mapeada
+5. Se `skipBot = true`: define `shouldActivateBot = false` → ticket entra como `pending` na fila mapeada, sem bot
 
 **Ordem de prioridade no roteamento:**
-`Force Wallet` > `Campaign Routing (48h window)` > `Tag Routing (fila)` > `VoxCall Routing` > `Fila padrão + Bot`
+`Force Wallet` > `Tag Routing` > `VoxCall Routing` > `Fila padrão + Bot`
 
-**IMPORTANTE:** Tag `skipBot` é um **override transversal** — mesmo que a fila venha de Campaign ou Wallet routing, a tag com `skipBot=true` desativa o bot. A tag NÃO substitui a fila quando campaign/wallet já definiram uma.
+**LogTickets:** Cria entrada `type: "tagRouting"` com `queueId` quando o roteamento por tag é ativado.
 
-**LogTickets:** Cria entrada `type: "tagRouting"` com `queueId` quando o roteamento por tag completo é ativado.
-
-**UI Admin:** Card "Roteamento por Tag" em `configuracoes.tsx` — lista mapeamentos, adiciona/remove, toggle ativo/inativo, toggle "Pular Bot", prioridade numérica, mensagem de saudação.
+**UI Admin:** Card "Roteamento por Tag" em `configuracoes.tsx` — lista mapeamentos, adiciona/remove, toggle ativo/inativo.
 
 ### Transferência
 
@@ -1081,8 +964,7 @@ await prisma.$executeRawUnsafe(
 findByEmail(email)                          // Login (inclui tenant)
 findById(id)                                // Por ID (inclui tenant)
 updatePresence(userId, status, isOnline)    // Atualizar presença
-setOnline(userId)                           // Conexão WebSocket/login — PRESERVA status "pause"
-setOffline(userId)                          // Desconexão WebSocket — PRESERVA status "pause"
+setOnline(userId) / setOffline(userId)      // Helpers de presença
 findOperatorsWithStats(tenantId)            // Operadores com contagem de tickets
 ```
 
@@ -1534,53 +1416,14 @@ Padrão profissional de isolamento (como Zendesk/Freshdesk):
 
 ```typescript
 // Auto-online: no login e conexão WebSocket
-// IMPORTANTE: setOnline() PRESERVA status "pause" — se operador está pausado,
-// apenas marca isOnline=true sem alterar status/pausedAt/currentPauseReasonId.
-// O broadcast WebSocket envia status correto ("pause" ou "online").
 userRepository.setOnline(userId);
 
 // Auto-offline: no logout e desconexão WebSocket
-// IMPORTANTE: setOffline() PRESERVA status "pause" — se operador está pausado,
-// apenas marca isOnline=false sem alterar status para "offline".
 userRepository.setOffline(userId);
 
 // Status manual: online, offline, pause
 PATCH /api/users/:id/presence
 Body: { status: "online" | "offline" | "pause" }
-// Quando status="pause", requer pauseReasonId no body
-```
-
-### Sistema de Pausa do Operador
-
-O sistema de pausa é um controle profissional que impede operadores pausados de receberem novos tickets:
-
-**Tabelas Prisma:**
-- `PauseReasons` — Motivos de pausa configuráveis (nome, ícone, cor, ativo, ordem)
-- `UserPauseHistory` — Histórico completo (userId, pauseReasonId, startedAt, endedAt, duration)
-- `Users.status` — "online" | "offline" | "pause"
-- `Users.pausedAt` — timestamp do início da pausa
-- `Users.currentPauseReasonId` — FK para PauseReasons
-
-**Bloqueio em 3 camadas:**
-1. **Distribuição automática** (`webhook.service.ts`): Antes de atribuir ticket, verifica `assignedUser.status !== "pause"`. Se pausado, ticket fica `pending` com `userId=null`.
-2. **Aceite manual** (`PATCH /api/tickets/:id`): Quando operador tenta aceitar ticket pending, verifica status. Se pausado → 403 "Você está em pausa. Retome o atendimento para aceitar novos tickets."
-3. **Persistência de pausa** (`user.repository.ts`): `setOnline()`/`setOffline()` verificam status antes de atualizar. Se "pause", apenas mudam `isOnline` sem resetar pausa. Reconexão WebSocket, refresh de página e login NÃO removem a pausa.
-
-**Frontend (sidebar):**
-- Botão de pausa no sidebar com dialog de seleção de motivo
-- Timer em tempo real mostrando duração da pausa
-- Badge visual de status (online/offline/pausa) no sidebar
-- Toast de erro quando operador pausado tenta aceitar ticket
-
-**Endpoints:**
-```
-GET    /api/pause-reasons                — Lista motivos ativos
-POST   /api/pause-reasons                — Cria motivo (admin)
-PUT    /api/pause-reasons/:id            — Edita motivo
-DELETE /api/pause-reasons/:id            — Remove motivo
-PATCH  /api/users/:id/presence           — Altera status (online/offline/pause)
-GET    /api/users/pause-history          — Histórico de pausas com filtros
-GET    /api/users/operators              — Operadores com stats (inclui pausa)
 ```
 
 ## Padrões de UI das Páginas
@@ -2233,164 +2076,6 @@ Pipeline completo serializado por ticket via `messageProcessingQueue.enqueue(tic
 const normalize = (s: string) => s.trim().toLowerCase().replace(/\s+/g, "_");
 // Match: normalize(tag_intent) === normalize(route.intentName)
 ```
-
----
-
-## Sistema de Campanhas WhatsApp
-
-Sistema completo de disparo em massa de templates WhatsApp com dashboard de acompanhamento em tempo real.
-
-### Arquitetura
-
-| Arquivo | Responsabilidade |
-|---------|-----------------|
-| `server/services/campaign.service.ts` | Envio de campanhas: processamento de contatos, disparo de templates, controle de ritmo |
-| `server/routes.ts` | Rotas REST de campanhas (CRUD, start, pause, resume, cancel, contacts, export) |
-| `client/src/pages/campanhas.tsx` | Lista de campanhas + Dashboard de acompanhamento |
-| `prisma/schema.prisma` | Modelos `Campaigns` e `CampaignContacts` |
-
-### Modelo de Dados
-
-#### Campaigns
-| Campo | Tipo | Descrição |
-|-------|------|-----------|
-| `id` | Serial PK | ID auto-incremento |
-| `name` | String | Nome da campanha |
-| `status` | String | `pending`, `scheduled`, `sending`, `paused`, `completed`, `cancelled` |
-| `templateName` | String | Nome do template aprovado |
-| `templateLanguage` | String | Idioma do template |
-| `templateCategory` | String | Categoria do template |
-| `templateComponents` | Json | Componentes do template (header, body, buttons) |
-| `whatsappId` | Int | FK → Whatsapps (canal de envio) |
-| `tenantId` | Int | FK → Tenants |
-| `totalContacts` | Int | Total de contatos na campanha |
-| `sentCount` | Int | Contatos enviados com sucesso |
-| `failedCount` | Int | Contatos com falha |
-| `start` | DateTime (NOT NULL) | Data/hora de início (agendamento ou execução) |
-| `completedAt` | DateTime? | Data/hora de conclusão |
-| `responseRouting` | Json? | Roteamento de respostas: `{type, queueId, aiAgentId, windowHours, autoTagId}` |
-
-#### CampaignContacts
-| Campo | Tipo | Descrição |
-|-------|------|-----------|
-| `id` | Serial PK | ID auto-incremento |
-| `campaignId` | Int | FK → Campaigns |
-| `contactId` | Int? | FK → Contacts (opcional) |
-| `messageRandom` | String | Identificador único do envio |
-| `messageId` | String? | Message ID retornado pela Meta (wamid) |
-| `status` | String | `pending`, `sent`, `delivered`, `read`, `replied`, `failed` |
-| `errorReason` | String? | Mensagem de erro se falhou |
-| `variables` | Json? | Variáveis personalizadas do template |
-| `ack` | Int | Acknowledgement level |
-
-### Status Machine
-
-```
-pending/scheduled → Iniciar → sending
-sending → Pausar → paused
-sending → Cancelar → cancelled
-sending → (todos enviados) → completed
-paused → Retomar → sending
-paused → Cancelar → cancelled
-```
-
-### Ações por Status
-
-| Status | Ações Disponíveis |
-|--------|-------------------|
-| `pending` / `scheduled` | Iniciar, Editar, Duplicar |
-| `sending` | Pausar, Cancelar |
-| `paused` | Retomar, Cancelar |
-| `completed` / `cancelled` | Duplicar, Exportar |
-
-### Endpoints API
-
-| Método | Rota | Descrição |
-|--------|------|-----------|
-| GET | `/api/campaigns` | Lista campanhas do tenant |
-| GET | `/api/campaigns/:id` | Detalhes da campanha |
-| POST | `/api/campaigns` | Cria campanha |
-| PATCH | `/api/campaigns/:id` | Atualiza campanha (usa `$queryRawUnsafe` para UPDATE) |
-| DELETE | `/api/campaigns/:id` | Remove campanha |
-| POST | `/api/campaigns/:id/start` | Inicia disparo |
-| POST | `/api/campaigns/:id/pause` | Pausa disparo |
-| POST | `/api/campaigns/:id/resume` | Retoma disparo |
-| POST | `/api/campaigns/:id/cancel` | Cancela disparo |
-| GET | `/api/campaigns/:id/contacts` | Lista contatos paginados |
-| POST | `/api/campaigns/:id/contacts` | Adiciona contatos (array JSON) |
-| GET | `/api/campaigns/:id/export` | Exporta relatório CSV |
-
-**IMPORTANTE — Route ordering:** Rotas específicas (`/start`, `/pause`, `/resume`, `/cancel`, `/contacts`, `/export`) devem ser registradas ANTES da rota genérica `/:id` para evitar que Express interprete "start" como um ID.
-
-### Dashboard (campanhas.tsx)
-
-- **Lista**: Cards com nome, status, progresso, botões de ação
-- **Dashboard**: Navegação automática ao clicar "Iniciar", barra de progresso, lista de contatos paginada
-- **WebSocket**: Evento `CAMPAIGN_PROGRESS` para progresso em tempo real durante envio. liveProgress é limpo 2s após campanha completar para não sobrescrever dados da API
-- **Polling automático**: A tela atualiza automaticamente em TODOS os estados:
-  - `sending`: 3s (detail) / 5s (contacts)
-  - `scheduled`: 10s (detecta auto-start pelo scheduler)
-  - `completed`/`cancelled`/`paused`: 15s (captura delivered/read/replied updates)
-- **Contadores calculados em tempo real**: Os cards (Enviados, Entregues, Lidos) são calculados via `groupBy` nos status reais dos `CampaignContacts` (não via incrementos acumulados no campo da campanha). Lógica cumulativa:
-  - `sentCount` = sent + delivered + read + replied
-  - `deliveredCount` = delivered + read + replied
-  - `readCount` = read + replied
-  - `repliedCount` = replied apenas
-  - `failedCount` = failed apenas
-- **Status dos contatos**: `pending` → `sent` → `delivered` → `read` → `replied` (ou `failed`). Cada status tem badge colorido no dashboard
-- **Filtro de contatos**: Dropdown com Pendentes, Enviados, Entregues, Lidos, Respondidos, Falharam
-- **Aviso de horário comercial**: Quando campanha tem `respectBusinessHours=true` e está fora do horário, mostra card amarelo "Aguardando horário comercial"
-- **Campanha agendada**: Botão "Antecipar Envio" (amber) com confirmação, card informativo azul com horário programado
-- **Campos de tempo em segundos**: Os campos de throttle (pausa entre lotes, delay min/max) são exibidos em segundos na UI mas armazenados em milissegundos no backend
-
-### Seleção de Canal (getConnection)
-
-O `getConnection()` em `campaign.service.ts` seleciona o canal de envio na seguinte ordem de prioridade:
-1. `channelRotation` (round-robin entre múltiplos canais)
-2. `campaign.sessionId` (canal específico selecionado)
-3. Canal com `isDefault: true` do tenant
-4. **Fallback**: qualquer canal WABA conectado do tenant (`type: "waba", status: "CONNECTED"`)
-
-### Rastreamento de Respostas (webhook)
-
-Quando um contato responde a uma mensagem de campanha:
-1. O webhook busca `CampaignContacts` com status `sent/delivered/read` do mesmo contato, dentro da `windowHours` (48h default)
-2. Atualiza o status do contato para `replied` e incrementa `repliedCount`
-3. Se `responseRouting` está configurado, aplica roteamento (fila/agente IA) e auto-tag
-4. O rastreamento funciona independente de `responseRouting` estar configurado
-
-### Status updates da Meta (webhook)
-
-Quando a Meta envia status updates (`delivered`, `read`):
-- Busca `CampaignContacts` pelo `messageId` com status anterior válido
-- `delivered`: aceita contatos com status `sent`
-- `read`: aceita contatos com status `sent`, `delivered` ou `replied` (caso resposta chegue antes do read)
-- Se contato já tem status `replied`, o `readCount` é incrementado mas o status permanece `replied` (não rebaixa)
-
-### IMPORTANTE — queryClient e IDs no path
-
-O `queryClient` padrão do VoxZap trata `queryKey[1]` como **query params object** (não path segment). Para rotas com ID no path (`/api/campaigns/123`), SEMPRE usar `queryFn` explícita:
-
-```typescript
-useQuery({
-  queryKey: ["/api/campaigns", campaignId],
-  queryFn: () => fetch(`/api/campaigns/${campaignId}`).then(r => r.json()),
-});
-```
-
-**NÃO usar** apenas `queryKey: ["/api/campaigns", campaignId]` sem `queryFn` — o fetcher padrão construirá a URL como `/api/campaigns?0=1&1=2&...` (errado).
-
-### PATCH com $queryRawUnsafe
-
-O campo `start` (DateTime NOT NULL) causa conflitos com Prisma `.update()`. O PATCH da campanha usa `$queryRawUnsafe` com SQL direto:
-
-```typescript
-await prisma.$queryRawUnsafe(`UPDATE "Campaigns" SET ... WHERE id = $1`, id);
-```
-
-### Contatos em Modo Edição
-
-Contatos são **read-only** em modo edição. O upload de contatos só é permitido na criação da campanha. Na edição, os contatos existentes são exibidos mas não podem ser modificados.
 
 ---
 

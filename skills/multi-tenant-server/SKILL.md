@@ -1503,10 +1503,31 @@ done
 
 ## 11. Firewall (UFW/iptables)
 
-Cada tenant precisa das seguintes portas abertas no firewall externo:
+### CRITICAL: Preservar portas de serviços existentes ao ativar UFW
+
+**Incidente real (Abr 2026):** Ao provisionar o primeiro tenant (PlanoClin) em um servidor que já tinha VoxZap rodando, o script habilitou UFW e só adicionou as portas do novo tenant. O VoxZap perdeu conectividade RTP para chamadas de voz WhatsApp porque as portas existentes (SIP 5060, RTP 10000-20000, TURN relay 49152-65535) foram bloqueadas pelo novo firewall.
+
+**REGRA:** Antes de habilitar/modificar UFW, SEMPRE verificar serviços existentes com `ss -ulnp; ss -tlnp` e garantir que TODAS as portas estejam permitidas.
+
+### Portas do sistema base (SEMPRE abrir)
 
 ```bash
-# Template para abrir portas de um tenant
+# Portas que DEVEM estar abertas em TODO servidor multi-tenant:
+ufw allow 22300/tcp comment "SSH"
+ufw allow 80/tcp comment "HTTP"
+ufw allow 443/tcp comment "HTTPS"
+ufw allow 5060/udp comment "SIP-UDP-main"
+ufw allow 5060/tcp comment "SIP-TCP-main"
+ufw allow 8089/tcp comment "Asterisk-WSS"
+ufw allow 10000:20000/udp comment "RTP-main"
+ufw allow 3478/udp comment "TURN-UDP"
+ufw allow 3478/tcp comment "TURN-TCP"
+ufw allow 49152:65535/udp comment "TURN-relay"
+```
+
+### Portas por tenant
+
+```bash
 open_tenant_ports() {
   local TENANT_ID=$1
   local SIP_PORT=$2
@@ -1524,6 +1545,10 @@ open_tenant_ports acme 5070 11000 11999
 # Exemplo: Tenant slot 2
 open_tenant_ports globex 5080 12000 12999
 ```
+
+### Docker network_mode para apps com chamadas WhatsApp
+
+**Apps que usam VoxCall-GW (WhatsApp Calling via ExternalMedia/ARI) DEVEM rodar com `network_mode: host`.** Com bridge networking, o Asterisk envia RTP para o IP do host mas os pacotes não chegam ao container Docker (sem port mapping para portas UDP dinâmicas). Com `network_mode: host`, o app recebe RTP diretamente.
 
 **ARI/WS não precisa de porta no firewall:** O Asterisk HTTP (ARI + WS) é vinculado a `127.0.0.1`. Clientes WebRTC acessam via Nginx HTTPS na porta 443 (`wss://dominio.com/ws` → Nginx termina TLS → proxy para `http://127.0.0.1:ARI_PORT/ws`).
 

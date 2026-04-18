@@ -441,6 +441,57 @@ export function getConfigDir(): string {
 
 Em produção, todos os configs estão em `/app/config/` (montado de `/opt/voxcall/config/` no host).
 
+## Asterisk Realtime Backend para `queue_log` — ARMADILHA do ODBC com PG 14+
+
+**Sintoma**: Após migração do PostgreSQL para versão 14+ (ex: 9.2 → 17), o dashboard do VoxCALL fica com **métricas zeradas** (Recebidas=0, TME/TMA zerados, SLA 0%) embora as chamadas estejam acontecendo normalmente. Inspecionando a tabela `queue_log`:
+- Eventos `ENTERQUEUE` **deixam de aparecer**
+- Eventos `CONNECT` / `COMPLETECALLER` chegam mas com `data1` / `data2` / `data3` **vazios**, e a coluna legada `data` recebe tudo concatenado: `"215|1776524400.135|7"`
+- A trigger `fn_atualiza_relatorio_operador` lê esse texto concatenado como nome de operador → polui `relatorio_operador` com "operadores fantasma" no formato `ramal|uniqueid|posição`
+
+**Causa raiz**: O `extconfig.conf` do Asterisk legado (Asterisk 11/13/16) usa o driver ODBC para gravar o `queue_log`:
+```ini
+queue_log => odbc,asterisk,queue_log
+```
+O `psqlodbcw.so` (libpq antiga embutida) cai num path de compatibilidade ao falar com PG 14+ — silenciosamente descarta o ENTERQUEUE e serializa os dados das colunas dinâmicas no campo legado `data`, em vez de separar em `data1`/`data2`/`data3`.
+
+**Fix definitivo — trocar para o driver nativo PostgreSQL do Asterisk:**
+
+```bash
+# 1. Backup
+cp /etc/asterisk/extconfig.conf /etc/asterisk/extconfig.conf.bak.$(date +%Y%m%d_%H%M%S)
+
+# 2. Trocar a linha do queue_log
+sed -i 's|^queue_log => odbc,.*|queue_log => pgsql,asterisk,queue_log|' /etc/asterisk/extconfig.conf
+
+# 3. Garantir que res_pgsql.conf aponta corretamente para o novo PG
+cat /etc/asterisk/res_pgsql.conf
+# [general]
+# dbhost=eveo1.voxserver.app.br
+# dbport=25432
+# dbname=asterisk
+# dbuser=asterisk
+# dbpass=...
+# requirements=warn
+
+# 4. Reload sem derrubar chamadas em curso
+asterisk -rx "module reload res_config_pgsql.so"
+asterisk -rx "module reload res_config_odbc.so"
+asterisk -rx "module reload app_queue.so"
+```
+
+**Validação ao vivo** (esperar próxima chamada entrar):
+```sql
+SELECT callid, event, data1, data2, data3, agent
+FROM queue_log
+WHERE eventdate > now() - interval '5 minutes'
+ORDER BY id DESC LIMIT 20;
+```
+Esperado: ENTERQUEUE com `data2`=callerid e `data3`=posição; CONNECT com `data1`=tempo de espera, `data2`=uniqueid, `data3`=posição original.
+
+**Não confunda com o backend CDR** (`cdr_pgsql.conf`) — esse usa libpq direto e funciona normalmente com qualquer PG. A armadilha é exclusiva do `extconfig.conf` (Realtime), que tem dois drivers possíveis (odbc vs pgsql) e o ODBC quebra com PG novo.
+
+**Nota sobre `fn_atualiza_relatorio_operador`**: A trigger NÃO precisa ser modificada para o PG novo. Adaptações antigas que parseavam o campo `data` concatenado eram contornos para o bug do ODBC — com o backend pgsql nativo, a versão padrão funciona normalmente.
+
 ## Atualização de Código (Update)
 
 Para atualizar o VoxCALL sem perder dados:
@@ -528,3 +579,51 @@ docker exec -e PGPASSWORD="PASS" $PGCONTAINER psql -U USER -d postgres \
 - **NPM Proxy Host ID:** 11
 - **Login:** superadmin / RiCa$0808
 - **Serviços coexistentes:** 14 serviços Docker Swarm (npm, postgres, apache, voxdial, portainer, etc.)
+
+---
+
+## Toggle SIP/PJSIP (chan_sip vs chan_pjsip)
+
+A maioria dos clientes Asterisk modernos usa **chan_pjsip** (`PJSIP/<ramal>`), porém alguns Asterisks legados (ex.: PlanoClin) só têm **chan_sip** carregado e exigem `SIP/<ramal>`. Quando o VoxCALL fala com um Asterisk legado usando `PJSIP/` hardcoded, os membros aparecem como `(Invalid)` em `queue show` e ramais não tocam.
+
+### Implementação (Task #49)
+
+- **Helper:** `server/asterisk-config.ts`
+  - `getChannelTech()` → `Promise<'PJSIP' | 'SIP'>` (default `PJSIP`, cache 30s)
+  - `setChannelTech(tech)` — persiste em `<configDir>/asterisk-config.json` e invalida cache
+  - `buildEndpoint(ramal)` → `Promise<string>` retorna `PJSIP/103` ou `SIP/103` conforme config
+  - `invalidateChannelTechCache()` — força reload na próxima leitura
+
+- **Endpoints REST (em `server/routes.ts`):**
+  - `GET /api/asterisk/channel-tech` — qualquer usuário autenticado
+  - `PUT /api/asterisk/channel-tech` — admin/superadmin, body `{ "channelTech": "SIP" | "PJSIP" }`
+
+- **UI:** Card "Channel Tech (SIP/PJSIP)" em `client/src/pages/settings.tsx` (logo após o card de AMI), com Select e descrição explicativa.
+
+- **Hardcodes substituídos por `await buildEndpoint(ramal)`:**
+  - `server/routes.ts` (13 locais) — supervisão (spy/whisper), insert em `queue_member_table` (login/QueueAdd em ring/sleep), Originate (dial), bulk endpoints
+  - `server/agent.ts` (4 locais) — spy, whisper, get_endpoint_details
+  - `server/dialer-engine.ts` (1 local) — discagem do dialer
+
+### Operação no PlanoClin
+
+```bash
+# Ver config atual no container
+docker exec planoclin-app cat /app/config/asterisk-config.json
+
+# Forçar SIP via arquivo (alternativa ao UI)
+docker exec planoclin-app sh -c 'echo "{\"channelTech\":\"SIP\"}" > /app/config/asterisk-config.json'
+docker restart planoclin-app   # invalida cache
+
+# Validar membros da fila
+docker exec planoclin-asterisk-extdb psql -U asterisk -d asterisk \
+  -c "SELECT membername, interface FROM queue_member_table ORDER BY membername;"
+# Esperado: interface = SIP/<ramal> (não PJSIP/)
+```
+
+### Importante
+
+- O default permanece `PJSIP` para não quebrar deploys existentes.
+- O cache de 30s significa que mudanças via UI levam até 30s para propagar (ou restart imediato).
+- Após mudar o toggle, **operadores precisam relogar** para que o login Asterisk recrie a entrada `queue_member_table` com o prefixo correto.
+- Se o Asterisk do cliente tem **ambos** `chan_sip` e `chan_pjsip` carregados, mantenha `PJSIP` (mais moderno).

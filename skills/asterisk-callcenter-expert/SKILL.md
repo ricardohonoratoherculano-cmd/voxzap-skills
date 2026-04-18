@@ -119,6 +119,25 @@ Estado **em tempo real** de cada operador — um registro por operador, atualiza
   - **DELETE** (deslogar): `DELETE FROM queue_member_table WHERE membername = operador` (remove de todas as filas)
 - Isso garante que o Asterisk respeita a pausa/logoff — sem esta trigger, o operador continuaria recebendo chamadas mesmo pausado
 
+### ⚠️ Pré-requisito: Backend Realtime do Asterisk DEVE ser pgsql (não ODBC) para PG 14+
+
+Antes de qualquer análise de `queue_log`, confirmar que o Asterisk grava os eventos com **`data1`/`data2`/`data3` populados separadamente**, não tudo concatenado na coluna legada `data`.
+
+**Diagnóstico rápido** — se a query abaixo retornar `data1/data2/data3` vazios para CONNECT/COMPLETE e a coluna `data` com algo tipo `"215|1776524400.135|7"`, o backend está errado:
+```sql
+SELECT event, data, data1, data2, data3 FROM queue_log
+WHERE event IN ('ENTERQUEUE','CONNECT','COMPLETECALLER')
+ORDER BY id DESC LIMIT 10;
+```
+
+**Sintoma típico**: ENTERQUEUE não aparece nunca, dashboard zerado, e `relatorio_operador` poluído com "operadores fantasma" no formato `ramal|uniqueid|posição` (porque a trigger lê o campo `data` concatenado como nome de operador).
+
+**Causa**: `extconfig.conf` do Asterisk com `queue_log => odbc,...` falando com PostgreSQL 14+ — o `psqlodbcw.so` legado cai em path de compatibilidade que serializa as colunas dinâmicas no campo `data` e descarta o ENTERQUEUE silenciosamente.
+
+**Fix**: trocar para o driver nativo `queue_log => pgsql,asterisk,queue_log` em `/etc/asterisk/extconfig.conf` (detalhes completos na skill `voxcall-native-asterisk-deploy`).
+
+**Importante**: Isso afeta APENAS o backend Realtime do `queue_log`. O CDR (`cdr_pgsql.conf`) usa libpq direto e funciona normalmente com qualquer versão de PG.
+
 **Triggers na `queue_log` para normalização e relatórios:**
 - **`trg_normaliza_transferencia`** (BEFORE INSERT) → `fn_normaliza_transferencia()`:
   - Quando `event IN ('ATTENDEDTRANSFER', 'BLINDTRANSFER')`: seta `data5 = 'TRANSFERENCIA'`
