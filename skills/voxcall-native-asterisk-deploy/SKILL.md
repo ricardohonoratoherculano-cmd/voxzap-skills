@@ -627,3 +627,231 @@ docker exec planoclin-asterisk-extdb psql -U asterisk -d asterisk \
 - O cache de 30s significa que mudanças via UI levam até 30s para propagar (ou restart imediato).
 - Após mudar o toggle, **operadores precisam relogar** para que o login Asterisk recrie a entrada `queue_member_table` com o prefixo correto.
 - Se o Asterisk do cliente tem **ambos** `chan_sip` e `chan_pjsip` carregados, mantenha `PJSIP` (mais moderno).
+
+---
+
+## Lição Aprendida — Deploy via `docker exec` precisa de `-w /app`
+
+**Sintoma:** Após `docker exec planoclin-app sh -c 'cd /app && npx vite build ...'`, o Vite reportou sucesso (`✓ built in 1m 3s`) mas os assets gerados (`/app/dist/public/assets/index-*.js`) NÃO foram atualizados — o navegador continuava carregando o JS antigo (sem o card novo) e o usuário não via a alteração da UI.
+
+**Causa raiz:** O `cd /app && npx vite build` dentro de `sh -c` resolveu o `outDir` relativo a partir de `client/` (onde fica o `vite.config.ts`), gerando os arquivos em `/dist/public/...` (raiz `/`) ao invés de `/app/dist/public/...`. O log do build mostra a pista: caminhos prefixados com `../dist/public/...` em vez de `dist/public/...`.
+
+**Fix correto:**
+
+```bash
+# ❌ ERRADO — outDir resolve errado
+docker exec planoclin-app sh -c 'cd /app && NODE_OPTIONS=--max-old-space-size=2048 npx vite build'
+
+# ✅ CERTO — usa -w /app para fixar o WORKDIR do exec
+docker exec -w /app planoclin-app sh -c 'NODE_OPTIONS=--max-old-space-size=2048 npx vite build'
+```
+
+**Como detectar o problema:**
+
+```bash
+# Se o card novo NÃO aparece no asset:
+docker exec planoclin-app sh -c 'grep -c "card-asterisk-channel-tech" /app/dist/public/assets/index-*.js'
+# 0 = build não chegou aos assets servidos → rebuildar com -w /app
+# 1+ = build OK → o problema é cache do navegador (Ctrl+Shift+R)
+
+# Verificar referência do index.html
+docker exec planoclin-app cat /app/dist/public/index.html | grep "assets/index"
+# Comparar mtime: se for antiga, o vite gerou em outro lugar
+docker exec planoclin-app ls -la /app/dist/public/assets/ | grep index-
+```
+
+**Regra geral:** sempre use `docker exec -w /app` para qualquer build (frontend ou backend) no container `planoclin-app` / `voxcall_voxcall` etc., evitando ambiguidade de WORKDIR.
+
+---
+
+## Lição Aprendida — Asterisk 20: systemd unit obrigatório com `StandardInput=null`
+
+**Sintoma:** Asterisk 20 recém-instalado consome 100% de CPU permanentemente (loop infinito de `read(0)/write(1)`), tornando o servidor inacessível.
+
+**Causa raiz:** O Asterisk foi iniciado com `-f -c` (foreground + console) sem TTY conectado (ex.: via `nohup`, `screen`, ou systemd sem `StandardInput`). O processo entra em loop tentando ler do stdin que não existe.
+
+**Fix definitivo — criar `/etc/systemd/system/asterisk20.service`:**
+
+```ini
+[Unit]
+Description=Asterisk 20 PBX (instalado em /opt/asterisk-20)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/asterisk-20/sbin/asterisk -f
+ExecStop=/opt/asterisk-20/sbin/asterisk -rx "core stop now"
+ExecReload=/opt/asterisk-20/sbin/asterisk -rx "core reload"
+Restart=on-failure
+RestartSec=5
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now asterisk20
+systemctl status asterisk20    # deve mostrar CPU em ~0%
+```
+
+**Diferenças críticas vs Asterisk 13/16/18:**
+- **NUNCA** use `-c` (console) em produção no Asterisk 20 — só com TTY interativo via `screen`/`tmux`
+- `StandardInput=null` é obrigatório (em versões antigas funcionava sem)
+- Use `-f` (foreground) puro com `Type=simple` no systemd — sem `-c`
+
+---
+
+## Lição Aprendida — Asterisk 20 removeu `Monitor()`, migrar para `MixMonitor()`
+
+**Sintoma:** Após upgrade pra Asterisk 20, qualquer chamada que passa pelo dialplan loga `WARNING: No application 'Monitor' for extension` e a chamada não grava.
+
+**Causa raiz:** A aplicação `Monitor()` foi removida do Asterisk 20. Substituta é `MixMonitor()` que mixa o áudio direto durante a gravação (não precisa mais de `soxmix` no fim).
+
+**Diferenças de sintaxe:**
+
+| Antiga (`Monitor`)                                                       | Nova (`MixMonitor`)                                                        |
+|--------------------------------------------------------------------------|----------------------------------------------------------------------------|
+| `Monitor(gsm,/var/spool/asterisk/monitor/${CDR(uniqueid)},mb)`           | `MixMonitor(/var/spool/asterisk/monitor/${CDR(uniqueid)}.gsm,b)`           |
+| Formato como 1º argumento, filename sem extensão                          | Filename inclui extensão; formato deduzido dela                             |
+| Flag `m` = mixa no fim com `soxmix` (gera 2 arquivos `-in.gsm`/`-out.gsm`)| Flag `m` removida — `MixMonitor` já mixa em tempo real (1 arquivo só)      |
+| Flag `b` = só grava quando bridged                                       | Flag `b` mantida com mesma semântica                                        |
+
+**Como migrar TODOS os `.conf` de uma vez (use perl, NÃO sed):**
+
+```bash
+ETC=/opt/asterisk-20/etc/asterisk
+# Backup ANTES
+tar -czf /root/asterisk-conf.bak.$(date +%Y%m%d_%H%M%S).tgz -C /opt/asterisk-20/etc asterisk
+
+# Substituir em todos .conf ativos (NÃO .conf_old/.bak)
+FILES=$(grep -lE '(^|[^a-zA-Z_])Monitor\(' $ETC/*.conf 2>/dev/null)
+for F in $FILES; do
+  perl -i -pe 's/(?<![a-zA-Z_])Monitor\((gsm|wav|alaw|ulaw|sln)\,(.+?)\,(mb|m|b)\)/MixMonitor($2.$1,b)/g' $F
+done
+
+# Verificar que não restou Monitor( ativo
+grep -nE '^[^;]*[^a-zA-Z_]Monitor\(' $FILES || echo 'Limpo'
+
+# Reload
+asterisk -rx 'dialplan reload'
+```
+
+**Por que perl e não sed?** O sed tradicional (`s/Monitor\(gsm,([^,)]+),...//`) **falha** quando o filename contém parênteses balanceados como `${CDR(uniqueid)}` — o `[^,)]+` para no `)` interno do `(uniqueid)`. Perl com regex non-greedy `(.+?)` funciona corretamente.
+
+**Skip arquivos `*.conf_old` e `*.bak`** — geralmente são backups antigos que confundem os greps de validação.
+
+---
+
+## Lição Aprendida — Bug ARI password: env var sobrescrevendo config file
+
+**Sintoma:** Tela do Operador mostra **STATUS=LIVRE** e **TEMPO** contando desde o login (ex.: `00:18:59`), mesmo durante uma chamada ativa. O Dashboard, no mesmo container/momento, mostra corretamente **OCUPADO**.
+
+**Causa raiz:** Em containers antigos do VoxCALL existe a env var `ARI_PASSWORD=ari_xxxxxxxxxxxxx` (gerada no provisionamento inicial). Várias funções faziam `process.env.ARI_PASSWORD || ariConfig.password`, ou seja, a env tinha precedência sobre o `ari-config.json`. Quando o usuário trocava a senha do ARI pela UI, o JSON era atualizado mas a env (errada) continuava sendo usada → falha de auth no ARI → `activeCall=null` → status caía pro default `LIVRE`.
+
+O dashboard funcionava porque seu fetch ARI usa **direto** `ariConfig.password` (sem env var).
+
+**Fix definitivo (em todos os call sites):**
+
+```typescript
+// ❌ ERRADO — env sobrescreve sempre
+const password = process.env.ARI_PASSWORD || ariConfig.password || '';
+if (process.env.ARI_PASSWORD) { config.password = process.env.ARI_PASSWORD; }
+
+// ✅ CORRETO — config file (gerenciado pela UI) tem precedência
+const password = ariConfig.password || process.env.ARI_PASSWORD || '';
+if (!config.password && process.env.ARI_PASSWORD) { config.password = process.env.ARI_PASSWORD; }
+```
+
+**Locais a corrigir** (greppe `process\.env\.ARI_PASSWORD`):
+- `server/routes.ts` → `loadAriConfig()` e o endpoint `GET /api/agent/status`
+- `server/agent.ts` → `loadAriConfig()`
+
+**Como detectar futuramente:**
+1. Se Dashboard ↔ Painel do Operador divergem (um detecta OCUPADO, outro fica em LIVRE)
+2. Compare a senha do `ari-config.json` no container com a env: `docker exec <app> sh -c 'env | grep ARI; cat /app/config/ari-config.json'`
+3. Se diferentes, esse bug está ativo no código
+
+---
+
+## Script de Deploy Automatizado — `.local/scripts/deploy-planoclin.sh`
+
+Pra deploys recorrentes de backend no PlanoClin (eveo1), existe um script que automatiza todo o fluxo: empacota source → scp → backup → extract → `docker compose build app` → recreate → aguarda bootstrap → sanity checks.
+
+**Uso:**
+```bash
+SSHPASS='senha' .local/scripts/deploy-planoclin.sh
+```
+
+**O que valida no fim:**
+- Data/tamanho do `dist/index.js` (confirma que rebuild rodou)
+- Número de ocorrências de `buildEndpoint` e `getChannelTech` no bundle (sanity da refatoração PJSIP/SIP)
+- Conteúdo atual de `/app/config/asterisk-config.json` (channelTech ativo)
+
+**Backup automático** do source antigo em `${TENANT_DIR}/source.bak.<timestamp>.tgz` pra rollback rápido.
+
+Reaproveitável pra outros tenants via env vars: `EVEO_HOST`, `EVEO_PORT`, `TENANT_DIR`, `APP_CONTAINER`, etc.
+
+---
+
+## Lição Aprendida — Asterisk 20 em `/opt/...` lê de `/opt/asterisk-20/etc/asterisk`, NÃO de `/etc/asterisk`
+
+**Sintoma:** Você edita um `.conf` em `/etc/asterisk/` (caminho convencional), dá `dialplan reload`, e a mudança **não aparece** no `dialplan show` / `pjsip show endpoints` / etc. O Asterisk continua executando a versão antiga como se você nunca tivesse editado.
+
+**Causa raiz:** Quando o Asterisk é compilado/instalado em prefixo customizado (`/opt/asterisk-20/`, `/usr/local/asterisk/`, etc), o `--sysconfdir` é definido pra dentro desse prefixo. O binary lê o `astetcdir` do `asterisk.conf` carregado via `-C`, que aponta pro diretório do prefixo — não pro `/etc/asterisk` tradicional. Se o servidor já tinha um Asterisk antigo (ex: 11/13 do RPM), o `/etc/asterisk/` continua existindo com configs **stale** que ninguém lê. Isso engana o operador que sempre edita "no lugar certo".
+
+**Como diagnosticar em 1 comando:**
+```bash
+ps -ef | grep -E '/asterisk.*-C ' | grep -v grep
+# Olhe o argumento -C: ex. -C /opt/asterisk-20/etc/asterisk/asterisk.conf
+
+# Confirme o astetcdir efetivo:
+asterisk -rx 'core show settings' | grep -i 'Configuration directory'
+```
+
+**Fix definitivo — unificar em `/etc/asterisk` via symlink (downtime ~5s):**
+
+```bash
+TS=$(date +%Y%m%d-%H%M%S)
+
+# 1) Backups (compactado + cópia direta)
+tar -czf /root/etc-asterisk-OLD-$TS.tgz -C /etc asterisk
+tar -czf /root/opt-asterisk20-etc-$TS.tgz -C /opt/asterisk-20/etc asterisk
+
+# 2) Para Asterisk
+systemctl stop asterisk20.service
+
+# 3) Move o /etc/asterisk velho pra .old e o config ATIVO pro lugar convencional
+mv /etc/asterisk /etc/asterisk.old-$TS
+mv /opt/asterisk-20/etc/asterisk /etc/asterisk
+
+# 4) Symlink reverso pra preservar tudo que aponta pro caminho antigo
+ln -s /etc/asterisk /opt/asterisk-20/etc/asterisk
+
+# 5) Sobe e valida
+systemctl start asterisk20.service
+sleep 4
+systemctl is-active asterisk20.service       # active
+asterisk -rx 'module show' | tail -1         # confirmar N módulos carregados
+asterisk -rx 'dialplan show <ctx>' | head    # confirma que lê do novo caminho
+```
+
+**Por que symlink em vez de mudar `astetcdir` no `asterisk.conf`:** o symlink torna `/opt/asterisk-20/etc/asterisk` e `/etc/asterisk` **literalmente o mesmo diretório** (qualquer caminho funciona), sem precisar editar `asterisk.conf` nem o systemd service. Scripts antigos hardcoded com `/opt/asterisk-20/etc/asterisk/...` continuam válidos.
+
+**Cuidado / pegadinha:**
+- O `core show settings` ainda mostra `Configuration directory: /opt/asterisk-20/etc/asterisk` porque é o que o systemd passa via `-C`. É só label visual — fisicamente é o symlink. Se quiser display "limpo", edite o systemd unit pra `-C /etc/asterisk/asterisk.conf` e altere `astetcdir => /etc/asterisk` no `asterisk.conf`.
+- Se o operador já tinha edits no `/etc/asterisk/` antigo (achando que era o ativo), eles **NÃO são portados** pra config nova — viram só backup em `/etc/asterisk.old-$TS/`. Avise pra refazer os edits no `/etc/asterisk/` atual.
+- Aplicativos terceiros (FreePBX, etc.) podem hardcodar caminhos absolutos — se houver, valide depois do symlink.
+
+**Como auditar futuramente** se o operador "editou e nada mudou":
+```bash
+# Confirma qual arquivo o Asterisk realmente carrega:
+asterisk -rx 'dialplan show <ctx>' | head -3   # mostra [arquivo:linha]
+# Compare mtime do arquivo em disco com a hora do edit:
+stat /etc/asterisk/<arquivo>.conf
+# Se forem arquivos diferentes (path/mtime), você está editando o lugar errado.
+```
