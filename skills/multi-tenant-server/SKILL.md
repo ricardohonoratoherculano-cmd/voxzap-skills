@@ -97,6 +97,8 @@ Cada tenant recebe um **slot numérico** (1, 2, 3...) que define todas as suas p
 | **ARI/WSS HTTP** | 8088 + N | 8089 | 8090 | 8091 | 8098 | 127.0.0.1 |
 | **RTP início** | 10000 + (N×1000) | 11000 | 12000 | 13000 | 20000 | 0.0.0.0 |
 | **RTP fim** | RTP início + 999 | 11999 | 12999 | 13999 | 20999 | 0.0.0.0 |
+| **VoxCall-GW RTP início** | 47000 + ((N-1)×100) | 47000 | 47100 | 47200 | 47900 | 0.0.0.0 |
+| **VoxCall-GW RTP fim** | GW início + 99 | 47099 | 47199 | 47299 | 47999 | 0.0.0.0 |
 
 **ARI e WS compartilham a mesma porta HTTP:** O Asterisk tem um único servidor HTTP interno (`http.conf`, `bindaddr=127.0.0.1`) que serve tanto a API REST do ARI (`/ari/...`) quanto WebSocket SIP para WebRTC (`/ws`). A porta ARI_PORT atende ambos.
 
@@ -379,7 +381,7 @@ services:
 
 ```nginx
 # Rate limiting zones (colocar no nginx.conf principal ou em conf.d/00-rate-limit.conf)
-# limit_req_zone $binary_remote_addr zone=api_limit:10m rate=30r/s;
+# limit_req_zone $binary_remote_addr zone=api_limit:20m rate=500r/s;
 # limit_req_zone $binary_remote_addr zone=login_limit:10m rate=5r/m;
 
 # Tenant: acme (slot 1, app porta 5001, ARI/WSS porta 8089)
@@ -409,9 +411,10 @@ server {
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     client_max_body_size 50M;
 
-    # Rate limiting na API
+    # Rate limiting na API (anti-DDoS de borda — limites finos por usuário/tenant
+    # ficam no Express, ver `server/middleware/rate-limit.ts`)
     location /api/ {
-        limit_req zone=api_limit burst=50 nodelay;
+        limit_req zone=api_limit burst=1000 nodelay;
         proxy_pass http://127.0.0.1:5001;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -465,11 +468,29 @@ Criar este arquivo para definir as zonas de rate limiting usadas por todos os te
 
 ```nginx
 # /opt/tenants/nginx/conf.d/00-rate-limit.conf
-# Zonas de rate limiting compartilhadas por todos os tenants
-limit_req_zone $binary_remote_addr zone=api_limit:10m rate=30r/s;
+# Zonas de rate limiting compartilhadas por todos os tenants.
+# IMPORTANTE: nginx atua APENAS como anti-DDoS de borda (limite por IP).
+# Limites finos por usuário/tenant rodam no Express
+# (server/middleware/rate-limit.ts). Não rebaixar para 30r/s sem motivo:
+# clientes corporativos saem por NAT — todos os operadores vêm do mesmo IP.
+limit_req_zone $binary_remote_addr zone=api_limit:20m rate=500r/s;
 limit_req_zone $binary_remote_addr zone=login_limit:10m rate=5r/m;
 limit_req_status 429;
 ```
+
+### Arquitetura de Rate Limit em 3 Camadas (recomendada)
+
+Validada em produção (Locktec, 2026-04). Sem isso, tenants com NAT corporativo bateram massivamente em `429`.
+
+| Camada | Onde | Limite | Por | Objetivo |
+|---|---|---|---|---|
+| 1. Anti-DDoS | nginx `api_limit` | 500 r/s burst 1000 | IP | Bloquear flood/abuso de borda |
+| 2. Por usuário | Express middleware | 60 r/s | `userId` | Conter operador/script com bug |
+| 3. Por tenant | Express middleware | 1000 r/s | `tenantId` | Proteger DB de tenant ruidoso |
+
+- Camadas 2 e 3 ficam no app: `server/middleware/rate-limit.ts` (in-memory `Map`, fail-open). Plugado em `authenticateToken`. Skip em `/api/health`, `/api/login`, `/api/auth`, `/api/webhook`, `/api/socket.io`.
+- 429 retorna sempre com header `Retry-After`. O frontend (`queryClient.ts`) respeita o header e faz retry só em GET/HEAD com jitter.
+- `use-socket.ts` no front coalesce invalidações de query (debounce 200–250 ms) para não pressionar a camada 2 quando há rajada de mensagens via socket.
 
 ### Wildcard SSL (Opcional)
 
@@ -925,7 +946,8 @@ mkdir -p "$TENANTS_DIR/nginx/conf.d"
 RATE_LIMIT_CONF="$TENANTS_DIR/nginx/conf.d/00-rate-limit.conf"
 if [ ! -f "$RATE_LIMIT_CONF" ]; then
   cat > "$RATE_LIMIT_CONF" <<'RATELIMIT'
-limit_req_zone $binary_remote_addr zone=api_limit:10m rate=30r/s;
+# Anti-DDoS de borda. Limites finos por usuário/tenant ficam no Express.
+limit_req_zone $binary_remote_addr zone=api_limit:20m rate=500r/s;
 limit_req_zone $binary_remote_addr zone=login_limit:10m rate=5r/m;
 limit_req_status 429;
 RATELIMIT
@@ -962,9 +984,9 @@ server {
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     client_max_body_size 50M;
 
-    # Rate limiting na API
+    # Rate limiting na API (anti-DDoS de borda; limites por usuário/tenant no Express)
     location /api/ {
-        limit_req zone=api_limit burst=50 nodelay;
+        limit_req zone=api_limit burst=1000 nodelay;
         proxy_pass http://127.0.0.1:$APP_PORT;
         proxy_http_version 1.1;
         proxy_set_header Host \\\$host;
@@ -1546,11 +1568,81 @@ open_tenant_ports acme 5070 11000 11999
 open_tenant_ports globex 5080 12000 12999
 ```
 
-### Docker network_mode para apps com chamadas WhatsApp
+### Docker networking para apps com WhatsApp Calling (VoxCall-GW)
 
-**Apps que usam VoxCall-GW (WhatsApp Calling via ExternalMedia/ARI) DEVEM rodar com `network_mode: host`.** Com bridge networking, o Asterisk envia RTP para o IP do host mas os pacotes não chegam ao container Docker (sem port mapping para portas UDP dinâmicas). Com `network_mode: host`, o app recebe RTP diretamente.
+O gateway de WhatsApp Calling abre um socket UDP por chamada para fazer relay de RTP entre Meta (opus@48kHz via WebRTC) e o Asterisk (alaw@8kHz). **Esse socket precisa ser alcançável pelo Asterisk no IP público do host.** Em bridge network, sem mapeamento explícito, os pacotes RTP do Asterisk morrem na borda Docker e a chamada conecta mas fica muda (`astSilenceMs` cresce 5s/10s/15s e o Meta encerra).
 
-**ARI/WS não precisa de porta no firewall:** O Asterisk HTTP (ARI + WS) é vinculado a `127.0.0.1`. Clientes WebRTC acessam via Nginx HTTPS na porta 443 (`wss://dominio.com/ws` → Nginx termina TLS → proxy para `http://127.0.0.1:ARI_PORT/ws`).
+Há **duas estratégias suportadas** — escolha conforme o tipo do servidor:
+
+#### Estratégia A — `network_mode: host` (single-tenant)
+
+Para servidores dedicados a **um único cliente**, o app pode rodar em `network_mode: host` e o socket UDP fica direto no host, sem precisar mapear nada.
+
+```yaml
+app:
+  network_mode: host
+  # remover blocos `ports:` e `networks:` quando usar host
+```
+
+❌ **Não use em servidores multi-tenant** — colide com outros apps que escutam em `:5000`.
+
+#### Estratégia B — Faixa fixa de portas UDP + bridge (multi-tenant) ✅ recomendada
+
+Para o servidor multi-tenant, cada tenant recebe uma **faixa exclusiva de ~100 portas UDP** que o gateway usa pra abrir os sockets de RTP. A faixa é mapeada explicitamente no `docker-compose` e liberada no firewall.
+
+**1. Alocação de faixa (slot do tenant):**
+
+| Tenant slot | Faixa RTP do gateway |
+|-------------|---------------------|
+| 1 | 47000-47099 |
+| 2 | 47100-47199 |
+| 3 | 47200-47299 |
+| N | `47000 + (N-1)*100` até `47099 + (N-1)*100` |
+
+> Faixa de 100 portas/tenant = ~50 chamadas WhatsApp simultâneas (cada chamada usa 2 portas: send+recv). Aumente se necessário.
+
+**2. `docker-compose.yml` do tenant — bloco `app`:**
+
+```yaml
+app:
+  ports:
+    - "127.0.0.1:${APP_PORT}:5000"
+    - "47000-47099:47000-47099/udp"   # faixa exclusiva deste tenant
+  environment:
+    - TZ=America/Sao_Paulo
+    - VOXCALL_RTP_PORT_MIN=47000
+    - VOXCALL_RTP_PORT_MAX=47099
+  networks:
+    - tenant-net
+```
+
+**3. Firewall (UFW):**
+
+```bash
+ufw allow 47000:47099/udp comment "VoxCall RTP - <tenant>"
+```
+
+**4. Setting `calling_voxcall_rtp_bind`:** deve conter o **IP público do host** (não `0.0.0.0`, não interno Docker). É o IP que vai pro SDP que o gateway envia ao Asterisk.
+
+**Como o gateway usa as env vars:** quando `VOXCALL_RTP_PORT_MIN/MAX` estão setados, a função `getAvailablePort()` sorteia portas dentro da faixa e testa via `bind(port, "0.0.0.0")` até achar uma livre. Sem essas env vars, cai no comportamento padrão (porta efêmera aleatória — só funciona em `network_mode: host`).
+
+#### Validação rápida pós-deploy
+
+```bash
+# Portas devem aparecer expostas no host
+docker ps --filter name=<tenant>-app --format '{{.Ports}}' | grep 47000-47099
+
+# Em uma chamada de teste, o log deve mostrar:
+docker logs --since 2m <tenant>-app | grep "Picked UDP port"
+# [VoxCall-GW] Picked UDP port 47042 from range 47000-47099
+
+# E astSilenceMs deve ficar < 100ms (não crescer 5s/10s/15s)
+docker logs --since 2m <tenant>-app | grep "DIAG.*astSilenceMs"
+```
+
+#### ARI/WS no firewall
+
+O Asterisk HTTP (ARI + WS) é vinculado a `127.0.0.1`. Clientes WebRTC acessam via Nginx HTTPS na porta 443 (`wss://dominio.com/ws` → Nginx termina TLS → proxy para `http://127.0.0.1:ARI_PORT/ws`). Não abrir ARI no firewall.
 
 **Portas que NÃO devem ser abertas externamente:**
 - APP_PORT (5001, 5002...) — acessado apenas pelo Nginx local
@@ -1634,9 +1726,23 @@ docker compose ps
 - Verificar config: `docker exec mt-nginx nginx -t`
 
 ### Conflito de portas RTP
-- Nunca alocar faixas RTP sobrepostas
-- Verificar: `ss -ulnp | grep -E '1[0-9]{4}'`
-- Cada tenant deve ter exatamente 1000 portas RTP exclusivas
+- Nunca alocar faixas RTP sobrepostas (Asterisk: 11000+, Gateway WhatsApp: 47000+)
+- Verificar Asterisk: `ss -ulnp | grep -E '1[0-9]{4}'`
+- Verificar Gateway WhatsApp: `ss -ulnp | grep -E '47[0-9]{3}'`
+- Cada tenant deve ter exatamente 1000 portas RTP do Asterisk + ~100 do gateway WhatsApp
+
+### WhatsApp Calling: chamada conecta mas sem áudio
+Sintoma: ligação atende, ICE/DTLS `connected`, mas `astSilenceMs` cresce 5s → 10s → 15s e o Meta encerra em ~20s.
+
+Causa mais comum: container do app em bridge network sem a faixa UDP do gateway exposta.
+
+Diagnóstico:
+```bash
+docker inspect <tenant>-app --format '{{.HostConfig.NetworkMode}}'
+docker logs --since 5m <tenant>-app | grep "DIAG.*astSilenceMs"
+```
+
+Correção: ver seção **11.3 Estratégia B** (faixa UDP `VOXCALL_RTP_PORT_MIN/MAX` + ports + UFW).
 
 ### Memória insuficiente
 - Monitorar: `./monitor-all.sh`

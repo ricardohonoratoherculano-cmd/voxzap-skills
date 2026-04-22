@@ -1681,6 +1681,24 @@ Padrão profissional de isolamento (como Zendesk/Freshdesk):
 - Botão "Aceitar" em tickets pendentes: sempre visível (sem guarda de `canInteract`)
 - `TICKET_UPDATE` via Socket.io: deseleciona ticket se aceito por outro operador
 
+### Isolamento de Mensagens entre Tickets do Mesmo Contato (CRÍTICO)
+
+**Bug histórico (corrigido 2026-04, Locktec):** `GET /api/tickets/:id/messages` retornava TODAS as mensagens do contato (mesma `contactId`) — quando um operador tinha 2+ tickets abertos em paralelo do mesmo contato (ex: cliente conversando com Comercial e Suporte ao mesmo tempo), as mensagens vazavam entre os tickets.
+
+**Regra correta** (`server/routes.ts` em `GET /api/tickets/:id/messages`):
+```typescript
+// Mensagens do ticket atual + mensagens de tickets FECHADOS do mesmo contato (histórico)
+where: {
+  OR: [
+    { ticketId: ticketId },                              // ticket atual
+    { ticket: { contactId, status: 'closed' } },         // histórico fechado
+  ],
+  tenantId,
+}
+```
+
+NUNCA filtrar apenas por `contactId` sem cláusula de status. O histórico fechado é mostrado para contexto, mas conversas paralelas em andamento ficam isoladas — comportamento esperado em ferramentas profissionais (Zendesk/Intercom).
+
 ## Presença do Operador
 
 ```typescript
@@ -2530,6 +2548,29 @@ useQuery({
 ```
 
 **NÃO usar** apenas `queryKey: ["/api/campaigns", campaignId]` sem `queryFn` — o fetcher padrão construirá a URL como `/api/campaigns?0=1&1=2&...` (errado).
+
+### Rate Limit & Resiliência (Arquitetura em 3 Camadas)
+
+Implementado em produção (Locktec, 2026-04) após operadores baterem em `429` por compartilharem IP NAT corporativo.
+
+**Camadas:**
+1. **Nginx (anti-DDoS de borda)** — `api_limit 500 r/s burst=1000` por IP. Rate em `/opt/tenants/nginx/conf.d/00-rate-limit.conf`, burst no `tenant_<id>.conf`. Login fica em `5 r/m burst=3`.
+2. **Express por usuário** — `server/middleware/rate-limit.ts`, 60 req/s por `userId` (responde `429` com header `Retry-After`). Plugado dentro de `authenticateToken` e respeita `X-Tenant-Id` (override de superadmin). Skip em `/api/health`, `/api/login`, `/api/auth`, `/api/webhook`, `/api/socket.io`.
+3. **Express por tenant** — mesmo middleware, 1000 req/s por `tenantId`. In-memory `Map`, fail-open (se o middleware quebra, libera).
+
+**Frontend (`client/src/lib/queryClient.ts`):**
+- `fetchWithRetry` respeita `Retry-After` e faz até 2 retries com jitter — **APENAS para GET/HEAD** (mutations seguem sem retry para preservar idempotência).
+- Em `429` ou resposta HTML do nginx, mensagem humanizada em PT-BR (nada de HTML cru no toast).
+
+**Frontend (`client/src/hooks/use-socket.ts`):**
+- `scheduleInvalidatePrefix(prefix, 250ms)` e `scheduleInvalidateTicketMessages(ticketId, 200ms)` coalescem rajadas de `invalidateQueries` disparadas pelos handlers (`handleNewMessage`, `handleTicketUpdate`, `handleNewTicket`, `handleTicketTransfer`, `handleTicketMessage`).
+- NUNCA chamar `queryClient.invalidateQueries({ predicate: key.startsWith('/api/tickets') })` direto dentro de handler de socket — usar os helpers, senão ressurge o problema de N refetchs por segundo.
+
+**Variáveis de ambiente** (defaults em `rate-limit.ts`):
+```
+USER_RATE_LIMIT=60        USER_RATE_WINDOW_MS=1000
+TENANT_RATE_LIMIT=1000    TENANT_RATE_WINDOW_MS=1000
+```
 
 ### PATCH com $queryRawUnsafe
 

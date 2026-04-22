@@ -119,25 +119,6 @@ Estado **em tempo real** de cada operador — um registro por operador, atualiza
   - **DELETE** (deslogar): `DELETE FROM queue_member_table WHERE membername = operador` (remove de todas as filas)
 - Isso garante que o Asterisk respeita a pausa/logoff — sem esta trigger, o operador continuaria recebendo chamadas mesmo pausado
 
-### ⚠️ Pré-requisito: Backend Realtime do Asterisk DEVE ser pgsql (não ODBC) para PG 14+
-
-Antes de qualquer análise de `queue_log`, confirmar que o Asterisk grava os eventos com **`data1`/`data2`/`data3` populados separadamente**, não tudo concatenado na coluna legada `data`.
-
-**Diagnóstico rápido** — se a query abaixo retornar `data1/data2/data3` vazios para CONNECT/COMPLETE e a coluna `data` com algo tipo `"215|1776524400.135|7"`, o backend está errado:
-```sql
-SELECT event, data, data1, data2, data3 FROM queue_log
-WHERE event IN ('ENTERQUEUE','CONNECT','COMPLETECALLER')
-ORDER BY id DESC LIMIT 10;
-```
-
-**Sintoma típico**: ENTERQUEUE não aparece nunca, dashboard zerado, e `relatorio_operador` poluído com "operadores fantasma" no formato `ramal|uniqueid|posição` (porque a trigger lê o campo `data` concatenado como nome de operador).
-
-**Causa**: `extconfig.conf` do Asterisk com `queue_log => odbc,...` falando com PostgreSQL 14+ — o `psqlodbcw.so` legado cai em path de compatibilidade que serializa as colunas dinâmicas no campo `data` e descarta o ENTERQUEUE silenciosamente.
-
-**Fix**: trocar para o driver nativo `queue_log => pgsql,asterisk,queue_log` em `/etc/asterisk/extconfig.conf` (detalhes completos na skill `voxcall-native-asterisk-deploy`).
-
-**Importante**: Isso afeta APENAS o backend Realtime do `queue_log`. O CDR (`cdr_pgsql.conf`) usa libpq direto e funciona normalmente com qualquer versão de PG.
-
 **Triggers na `queue_log` para normalização e relatórios:**
 - **`trg_normaliza_transferencia`** (BEFORE INSERT) → `fn_normaliza_transferencia()`:
   - Quando `event IN ('ATTENDEDTRANSFER', 'BLINDTRANSFER')`: seta `data5 = 'TRANSFERENCIA'`
@@ -811,94 +792,14 @@ O discador preditivo está **implementado e funcional**. Arquivo principal: `ser
 - VPS trigger `fn_atualiza_relatorio_operador`: faltava UNIQUE index em `relatorio_operador(data, operador, fila)` — causava ROLLBACK de toda a cascade de triggers, impedindo gravação do CONNECT
 - Relatório de Operadores: removida captura AMI (operatorRamal/operatorName do InFlightCall), substituída por trigger PostgreSQL `trg_dialer_agent_performance` para dados consistentes
 
-### Habilitar CEL para captura de canal externo
-
-O campo `t_monitor_voxcall.canal` (canal SIP do tronco externo, ex: `SIP/187.72.45.132-000018ef`) só é preenchido quando o pipeline CEL está ativo:
-
-```
-Asterisk CEL (CHAN_START) → INSERT em cel (UNLOGGED) → trigger trg_cel_captura_canal
-   → INSERT em canal_chamada (linkedid, canal) → trigger monitor_voxcall() lê no CONNECT
-   → UPDATE t_monitor_voxcall.canal
-```
-
-**Pré-requisitos no PostgreSQL do extdb (já no schema bootstrap):**
-- Tabela `cel` deve ser **UNLOGGED** (não PERMANENT). Validar:
-  ```sql
-  SELECT relpersistence FROM pg_class WHERE relname='cel';  -- deve ser 'u'
-  ```
-  Se estiver `'p'`, fazer `DROP TABLE cel CASCADE` e recriar conforme `server/asterisk-schema.sql:984-1006`, depois reaplicar `trg_cel_captura_canal`.
-- Trigger `trg_cel_captura_canal` (BEFORE INSERT) + função `fn_cel_captura_canal()` que retorna NULL.
-- Tabela `canal_chamada(linkedid PK, canal, created_at)` + trigger de cleanup `trg_canal_chamada_cleanup` (24h).
-
-**Smoke test do pipeline DB:**
-```sql
-INSERT INTO cel (eventtype, channame, linkedid)
-VALUES ('CHAN_START', 'SIP/test-trunk-99999', 'smoke_test_001');
-SELECT 'cel' AS tbl, COUNT(*) FROM cel WHERE linkedid='smoke_test_001'      -- esperado 0 (cancelado)
-UNION ALL SELECT 'canal_chamada', COUNT(*) FROM canal_chamada WHERE linkedid='smoke_test_001';  -- esperado 1
-DELETE FROM canal_chamada WHERE linkedid='smoke_test_001';
-```
-
-**Configuração no Asterisk:**
-
-> **IMPORTANTE — Asterisk 11 antigo (CentOS 7, instalações via SVN/source pré-2022):** o `cel_pgsql.so` pode não estar compilado mesmo que o source exista. Verificar com `ls /usr/lib*/asterisk/modules/ | grep cel_`. Se ausente, compilar manualmente:
-> ```bash
-> # Pré-req: yum install postgresql-devel  (já costuma estar instalado se cdr_pgsql funciona)
-> cd /usr/src/asterisk-<versão>
-> cp menuselect.makeopts menuselect.makeopts.bak
-> sed -i 's/\bcel_pgsql\b//' menuselect.makeopts   # remove da lista de excluídos
-> make cel                                          # compila apenas os módulos cel/
-> cp cel/cel_pgsql.so /usr/lib64/asterisk/modules/  # ou /usr/lib/asterisk/modules/
-> cp menuselect.makeopts.bak menuselect.makeopts    # restaura
-> asterisk -rx 'module load cel_pgsql.so'
-> asterisk -rx 'core reload'                        # relê cel.conf
-> asterisk -rx 'cel show status'                    # deve mostrar "Enabled" + "CEL PGSQL backend"
-> ```
-> Caso não tenha source, alternativas: instalar pacote (`yum search asterisk-cel`) ou usar `cel_manager.so` (eventos AMI, requer listener custom).
-
-`/etc/asterisk/cel.conf`:
-```ini
-[general]
-enable=yes
-apps=all
-events=CHAN_START
-
-[manager]
-enabled=yes
-```
-
-`/etc/asterisk/cel_pgsql.conf` (preferir `cel_pgsql` por ser conexão direta, sem ODBC):
-```ini
-[global]
-hostname=<host_do_extdb>
-port=<porta_do_extdb>
-dbname=asterisk
-user=asterisk
-password=<senha>
-table=cel
-```
-
-Alternativa via ODBC (`cel_odbc.conf` + DSN `asterisk-connector` em `res_odbc.conf`):
-```ini
-[asterisk]
-connection=asterisk
-table=cel
-usegmtime=no
-allowleapsecond=no
-```
-
-**Reload e validação:**
-```bash
-asterisk -rx "module reload cel.so"
-asterisk -rx "module reload cel_pgsql.so"   # ou cel_odbc.so
-asterisk -rx "cel show status"
-
-# Após uma chamada nova:
-psql -c "SELECT COUNT(*) FROM canal_chamada WHERE created_at > now() - interval '5 min';"
-# Esperado: > 0
-```
-
-**Lookup de protocolo (corrigido 2026-04-18)**: A tabela `protocolo` pode ter 2 rows com o mesmo `callid` (placeholder vazio + valor real `DDMMYYYYHHMMSS`). A função `monitor_voxcall()` precisa filtrar `protocolo IS NOT NULL AND protocolo <> ''` com `ORDER BY protocolo DESC LIMIT 1`. Ver `server/asterisk-schema.sql:407-413`.
+**CEL / canal_chamada (pendente)**:
+- A tabela `cel` existe como UNLOGGED no VPS, com trigger `fn_cel_captura_canal` que captura CHAN_START → `canal_chamada`
+- CEL está **desativado** no Asterisk (`cel.conf` com `enable=yes` comentado)
+- Backend ODBC do CEL (`cel_odbc.conf`) sem configuração ativa
+- O módulo `cel_odbc.so` está carregado no Asterisk mas o CEL core precisa de restart completo para ativar
+- ODBC DSN `asterisk-connector` funciona (localhost:25432, mesmo do CDR)
+- Para ativar: configurar `cel.conf` (enable=yes, events=CHAN_START) e `cel_odbc.conf` (connection=asterisk, table=cel), depois restart do Asterisk
+- O campo `canal` em `t_monitor_voxcall` fica vazio até o CEL ser ativado
 
 ### Dados Disponíveis na `retorno_historico`
 

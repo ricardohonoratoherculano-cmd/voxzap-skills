@@ -70,6 +70,40 @@ Run all 8 steps in order. Step 5 **RESETS THE DATABASE** — only the default Su
 - **Health check:** Verifies `systemctl is-active coturn` + port 3478 listening after install
 - **Config includes `verbose`** for session-level logging in `/var/log/turnserver.log`
 
+## Post-Deploy Troubleshooting
+
+### Webhooks Parados Após Deploy ("Invalid signature")
+
+**Sintoma:** Após deploy/update, TODAS as mensagens recebidas param de funcionar. Logs mostram:
+```
+[Webhook] POST received, entries=1
+[Webhook] Invalid signature, rejecting payload
+POST /api/webhook/whatsapp 403
+```
+
+**Causa:** O campo `Tenants.metaToken` está preenchido com um valor incorreto (não corresponde ao App Secret real da Meta). Quando o valor existe e é diferente do padrão, a validação HMAC-SHA256 é ativada e rejeita tudo.
+
+**Diagnóstico via SSH:**
+```bash
+docker logs voxzap-app --since 10m 2>&1 | grep "Invalid signature"
+```
+
+**Correção imediata no banco:**
+```sql
+UPDATE "Tenants" SET "metaToken" = '<META_TOKEN_FROM_SCRATCHPAD>' WHERE id = 1;
+```
+Isso reseta para o valor padrão, pulando a validação de assinatura. Não precisa reiniciar o container — a query é feita em tempo real.
+
+**Nota:** O container NÃO precisa de variável de ambiente `WHATSAPP_APP_SECRET` ou `META_APP_SECRET`. O App Secret é resolvido do banco (`Tenants.metaToken`) por tenant. Ver documentação completa na skill `whatsapp-messaging-expert` → "Validação de Assinatura".
+
+### Verificação de Container VPS
+
+```bash
+docker inspect voxzap-app --format='Created: {{.Created}} Started: {{.State.StartedAt}}'
+docker logs voxzap-app --since 5m 2>&1 | tail -30
+docker exec voxzap-app printenv | grep -E 'NODE_ENV|DATABASE_URL|SESSION_SECRET'
+```
+
 ## CRITICAL RULES — Lessons Learned from Production
 
 ### 1. Database Driver: `pg` in Production, Neon in Development
@@ -117,6 +151,48 @@ CMD ["npm", "start"]
 - **`postgres:16-alpine`** (not 15)
 - **DB port bound to localhost** — `127.0.0.1:5432:5432` (not exposed externally)
 - **Docker resource isolation** — VoxCALL and Asterisk MUST use completely separate service names, volume names, and network names (see "Docker Resource Isolation" section below)
+
+### 3b. VoxZap with WhatsApp Calling Gateway: `network_mode: host` (CRITICAL)
+When the VoxZap app includes the WhatsApp→Asterisk calling gateway, the app container **MUST** use `network_mode: host` instead of a Docker bridge network.
+
+**WHY:** The calling gateway opens dynamic UDP ports (e.g., 46001, 46002...) for RTP relay between Asterisk and WhatsApp/Meta. In a Docker bridge network with only `expose: ["5000"]`, these UDP ports are NOT accessible externally. Asterisk sends RTP to `calling_voxcall_rtp_bind:port` but packets never reach the container. Symptom: WebRTC connects (ice=connected, dtls=connected) but `astSilenceMs` grows indefinitely — no audio from Asterisk.
+
+**Required docker-compose.yml:**
+```yaml
+services:
+  app:
+    build:
+      context: .
+      args:
+        - TZ=America/Sao_Paulo
+    container_name: voxzap-app
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=America/Sao_Paulo
+    volumes:
+      - ./uploads:/app/uploads
+    network_mode: host
+
+  nginx:
+    image: nginx:alpine
+    container_name: voxzap-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+      - /etc/letsencrypt:/etc/letsencrypt
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+```
+
+**Consequences of `network_mode: host`:**
+- nginx.conf MUST use `proxy_pass http://host.docker.internal:5000;` (NOT `http://app:5000`)
+- nginx container needs `extra_hosts: ["host.docker.internal:host-gateway"]` to resolve `host.docker.internal`
+- The app container cannot use Docker `networks:` (incompatible with `network_mode: host`)
+- DATABASE_URL must use external hostname or `localhost` (not Docker service names like `db`)
 
 ### 4. nginx.conf: String Array Concatenation, NOT Template Literals
 When generating nginx config, use string array `.join('\n')`, NOT ES6 template literals.
@@ -370,7 +446,7 @@ systemctl enable --now coturn
 #### VoxZap (voxtel.voxzap.app.br)
 - **VPS:** 72.61.34.151 port 3478 (UDP + TCP)
 - **Realm:** voxtel.voxzap.app.br
-- **User:** voxzap / VoxTurn2026!
+- **User:** voxzap / <TURN_PASSWORD_FROM_SCRATCHPAD>
 - **Config file:** `/etc/turnserver.conf`
 - **Service:** `systemctl status coturn`
 - **Verbose logging:** enabled (`verbose` directive in config)
@@ -380,7 +456,7 @@ systemctl enable --now coturn
 #### VoxCALL (voxdrive.voxtel.app.br)
 - **VPS:** 85.209.93.135 port 3478 (UDP)
 - **Realm:** voxdrive.voxtel.app.br
-- **User:** voxcall / VoxTurn2026!
+- **User:** voxcall / <TURN_PASSWORD_FROM_SCRATCHPAD>
 - **Config file:** `/etc/turnserver.conf`
 - **Service:** `systemctl status coturn`
 
@@ -394,34 +470,12 @@ systemctl enable --now coturn
 - **coturn**: Installed on this VPS for WebRTC TURN relay
 
 ### Asterisk Server (boghos.voxcall.cc)
-- **SSH**: boghos.voxcall.cc:22300, user root, same password as app VPS
+- **SSH**: boghos.voxcall.cc:22300, user root (password in agent scratchpad)
 - **Public IP**: 77.37.69.68
 - **Containers**: `voxcall-asterisk` (network_mode: host), `voxcall-asterisk-db` (PostgreSQL 16-alpine on port 25432)
 - **Purpose**: Runs Asterisk 22 PBX with PJSIP realtime
 - **Docker Compose**: `/opt/voxcall/docker-compose.asterisk.yml`
 - **Config dir**: Inside container at `/etc/asterisk/` (pjsip_wizard.conf, rtp.conf, etc.)
-
-### VoxZap/VoxCALL Docker Networking for WhatsApp Calling (CRITICAL)
-**Any app that uses WhatsApp Calling via VoxCall-GW (ExternalMedia + ARI) MUST use `network_mode: host` in its Docker container.** The VoxCall-GW creates ARI ExternalMedia channels on a remote Asterisk, which sends RTP to the app's `calling_voxcall_rtp_bind` IP. With Docker bridge networking, these incoming UDP/RTP packets are DROP'd because there's no port mapping for dynamic RTP ports. With `network_mode: host`, the app binds directly to the host network and receives RTP without NAT.
-
-**Incident (Apr 2026):** VoxZap at voxtel.voxzap.app.br had WhatsApp calls working with Docker bridge + no firewall. When PlanoClin multi-tenant was deployed and UFW was enabled, the conntrack-based return RTP path broke. Fix: change VoxZap to `network_mode: host`.
-
-**Docker Compose for apps with calling:**
-```yaml
-services:
-  app:
-    build: .
-    container_name: voxzap-app
-    restart: unless-stopped
-    network_mode: host        # REQUIRED for ExternalMedia RTP
-    env_file: .env
-    volumes:
-      - ./uploads:/app/uploads
-```
-
-**When enabling UFW on a server, always ensure ALL existing services have their ports opened:**
-- 5060 UDP/TCP (SIP), 8089 TCP (WSS), 10000-20000 UDP (RTP), 3478 UDP/TCP (TURN), 49152-65535 UDP (TURN relay)
-- Check existing listeners with `ss -ulnp; ss -tlnp` BEFORE enabling UFW
 
 ### Asterisk NAT Configuration (CRITICAL)
 When Asterisk runs in Docker, even with `network_mode: host`, the PJSIP transports MUST have `local_net` configured. Without it, Asterisk doesn't know when to use `external_media_address` in SDP, causing no-audio issues.
@@ -464,7 +518,7 @@ File: `sip-webrtc-config.json` (project root, read by `GET /api/sip-webrtc/confi
   "stunServer": "stun:stun.l.google.com:19302",
   "turnServer": "turn:85.209.93.135:3478",
   "turnUsername": "voxcall",
-  "turnPassword": "VoxTurn2026!",
+  "turnPassword": "<TURN_PASSWORD_FROM_SCRATCHPAD>",
   "enabled": true
 }
 ```
@@ -889,7 +943,7 @@ Replace `DOMAIN` with the actual domain (e.g., `voxtel.voxcall.cc`).
 
 **Important:** The Asterisk container MUST have `/etc/letsencrypt` mounted as a volume. The `docker-compose.asterisk.yml` now includes `- /etc/letsencrypt:/etc/letsencrypt:ro` in the asterisk service volumes.
 
-**Note:** Also check `ari.conf` — passwords may be truncated (e.g., `RiCa@853198` instead of full `RiCa@8531989898`).
+**Note:** Also check `ari.conf` — passwords may be truncated (first 10 chars instead of full password). Compare with the ARI password in the agent scratchpad.
 
 ### WebRTC audio issues (one-way or no audio)
 1. Check if coturn is running: `systemctl status coturn`
