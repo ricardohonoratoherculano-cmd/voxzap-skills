@@ -1383,6 +1383,45 @@ if (!res.ok || data.error) {
 }
 ```
 
+#### 7. ❗ Frontend: NUNCA ler o body de uma `Response` duas vezes
+Bug recorrente em `client/src/lib/queryClient.ts` — `throwIfResNotOk`:
+
+```typescript
+// ❌ ERRADO: se .json() falha, .text() lança "body stream already read"
+try {
+  const json = await res.json();
+  errorMessage = json.message || ...;
+} catch {
+  const text = await res.text(); // ← STREAM JÁ CONSUMIDO
+  if (text) errorMessage = text;
+}
+```
+
+Sintoma para o usuário final: toast vermelho `"Erro ao enviar mensagem — Failed to execute 'text' on 'Response': body stream already read"` mascarando o erro real do servidor (ex: janela 24h, validação Zod, 401, etc).
+
+**Padrão correto** — ler como text uma vez e tentar parsear:
+```typescript
+async function throwIfResNotOk(res: Response) {
+  if (!res.ok) {
+    let errorMessage = res.statusText;
+    try {
+      const text = await res.text();
+      if (text) {
+        try {
+          const json = JSON.parse(text);
+          errorMessage = json.message || json.error || text;
+        } catch {
+          errorMessage = text;
+        }
+      }
+    } catch { /* mantém statusText */ }
+    throw new Error(errorMessage);
+  }
+}
+```
+
+Alternativa: `res.clone().json()` antes do primeiro consumo. Mas o padrão acima é mais simples e cobre todos os casos (HTML de erro do nginx, body vazio, JSON malformado, etc).
+
 ## Assistente IA para Templates
 
 ### Arquitetura
