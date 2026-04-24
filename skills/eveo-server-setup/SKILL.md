@@ -30,6 +30,8 @@ Sem instrução em contrário, a equipe instala Docker no padrão (`/var/lib/doc
 
 ---
 
+> **Nota cruzada**: o pre-flight check da skill `voxzap-multitenant-install` valida automaticamente se o Docker está rodando no maior volume disponível e aborta com exit 1 caso contrário. Use esse check como rede de segurança antes de provisionar QUALQUER tenant novo, mesmo em servidor que já parece configurado. Ele detecta também se alguém esqueceu de migrar o Docker pra `/nvme` depois de reiniciar a VPS.
+
 ## 1. Inventário inicial (sempre rodar antes de qualquer coisa)
 
 ```bash

@@ -182,6 +182,67 @@ Faixa RTP só é usada se o tenant tiver gateway de **WhatsApp Calling → Aster
 - `/opt/tenants/nginx/` rodando (container `tenants-nginx`)
 - Certbot binário disponível (`/usr/bin/certbot`) com webroot em `/var/www/certbot`
 
+### 🛑 Pre-flight check OBRIGATÓRIO (rodar ANTES de qualquer mkdir/build)
+
+Este check evita o bug histórico do Locktec: instalar tenant no SSD pequeno enquanto o NVMe grande fica ocioso. **Aborta com exit 1 se algo estiver errado.** Copiar e colar exatamente como está no servidor remoto:
+
+```bash
+set -e
+echo '=== Pre-flight: detecção da melhor partição para o tenant ==='
+
+# 1. Lista todos os filesystems montados, não-loop, não-tmpfs, ordenados por tamanho
+echo '--- Volumes disponíveis ---'
+df -BG --output=target,size,avail,pcent -x tmpfs -x devtmpfs -x squashfs 2>/dev/null \
+  | tail -n +2 | sort -k2 -h -r
+
+# 2. Identifica o MAIOR volume montado (descarta /boot, snap, overlay)
+BEST_MOUNT=$(df -BG --output=target,size -x tmpfs -x devtmpfs -x squashfs 2>/dev/null \
+  | tail -n +2 \
+  | grep -vE '^/boot|^/snap|^/var/lib/docker/overlay|^/run' \
+  | sort -k2 -h -r | head -1 | awk '{print $1}')
+BEST_SIZE_G=$(df -BG --output=size "$BEST_MOUNT" | tail -1 | tr -dc '0-9')
+BEST_AVAIL_G=$(df -BG --output=avail "$BEST_MOUNT" | tail -1 | tr -dc '0-9')
+echo "→ Maior volume detectado: $BEST_MOUNT (${BEST_SIZE_G}G total, ${BEST_AVAIL_G}G livres)"
+
+# 3. Onde Docker está armazenando dados?
+DOCKER_ROOT=$(docker info 2>/dev/null | awk '/Docker Root Dir/{print $NF}')
+DOCKER_MOUNT=$(df -BG --output=target "$DOCKER_ROOT" 2>/dev/null | tail -1)
+DOCKER_AVAIL_G=$(df -BG --output=avail "$DOCKER_ROOT" 2>/dev/null | tail -1 | tr -dc '0-9')
+echo "→ Docker root: $DOCKER_ROOT (em $DOCKER_MOUNT, ${DOCKER_AVAIL_G}G livres)"
+
+# 4. HARD FAIL #1: Docker NÃO está no maior volume
+if [ "$DOCKER_MOUNT" != "$BEST_MOUNT" ]; then
+  echo "❌ ABORT: Docker está em $DOCKER_MOUNT mas o maior volume é $BEST_MOUNT."
+  echo "   Rodar a skill 'eveo-server-setup' (seção 5: Procedimento de MIGRAÇÃO) ANTES de continuar."
+  echo "   Resumo: parar Docker, mover /var/lib/docker para ${BEST_MOUNT}/docker,"
+  echo "   ajustar /etc/docker/daemon.json com data-root=${BEST_MOUNT}/docker, restart."
+  exit 1
+fi
+
+# 5. HARD FAIL #2: pouco espaço livre no maior volume (< 50G)
+if [ "${BEST_AVAIL_G:-0}" -lt 50 ]; then
+  echo "❌ ABORT: Apenas ${BEST_AVAIL_G}G livres em $BEST_MOUNT. Mínimo 50G por tenant VoxZap."
+  echo "   Rodar 'docker system prune -a' ou expandir o volume antes de continuar."
+  exit 1
+fi
+
+# 6. Se /nvme não existir mas o maior volume tiver outro nome, avisar e adaptar
+TENANT_DATA_ROOT="${BEST_MOUNT}/tenants"
+if [ "$BEST_MOUNT" != "/nvme" ]; then
+  echo "⚠️  AVISO: maior volume é '$BEST_MOUNT' (não '/nvme'). Os bind mounts do tenant vão para:"
+  echo "      $TENANT_DATA_ROOT/<tenant>/{uploads,config}"
+  echo "   Atualizar docker-compose.yml com este path antes do 'docker compose up'."
+fi
+
+echo "✅ Pre-flight OK. Tenant será instalado em: $TENANT_DATA_ROOT"
+echo "   Exportando para uso nos próximos passos:"
+echo "   export TENANT_DATA_ROOT=$TENANT_DATA_ROOT"
+```
+
+**Regra**: nunca hardcode `/nvme/tenants/...` no docker-compose.yml até este check ter rodado e exportado `TENANT_DATA_ROOT`. Substituir todos os `/nvme/tenants/<tenant>` desta skill por `${TENANT_DATA_ROOT}/<tenant>` quando estiver gerando os templates.
+
+**Por que este check existe (bug histórico Locktec — abril/2026)**: a equipe instalou Docker no padrão (`/var/lib/docker` no SSD ~100GB) sem perceber que o servidor tinha 1.8TB de NVMe RAID montado em `/nvme` totalmente ociosos. Resultado: SSD lotou em 2 semanas, app caiu, foi preciso parar tudo e migrar Docker pro NVMe (downtime). Este check captura essa situação ANTES de instalar qualquer coisa nova.
+
 ### Passo a passo
 
 #### 1. Decidir slot e gerar credenciais (no Replit / local)
@@ -230,9 +291,13 @@ await sftpUpload('.local/build/voxzap-source.tar.gz', `/tmp/${TENANT_ID}-source.
 
 #### 4. Criar diretórios + extrair
 ```bash
+# IMPORTANTE: $TENANT_DATA_ROOT vem exportado pelo pre-flight check (acima).
+# Em servidores EVEO padrão, será /nvme/tenants. Em outros provedores pode variar.
+: "${TENANT_DATA_ROOT:?ERRO: pre-flight check não rodou. Voltar e executar a seção 'Pre-flight check OBRIGATÓRIO'.}"
+
 mkdir -p /opt/tenants/<tenant>/source
-mkdir -p /nvme/tenants/<tenant>/{uploads,config}
-chmod 755 /nvme/tenants/<tenant>
+mkdir -p $TENANT_DATA_ROOT/<tenant>/{uploads,config}
+chmod 755 $TENANT_DATA_ROOT/<tenant>
 tar xzf /tmp/<tenant>-source.tar.gz -C /opt/tenants/<tenant>/source
 ```
 
@@ -504,11 +569,12 @@ Adicionar nova linha aqui a cada novo tenant provisionado. Marcar `notas` se foi
 
 ## Checklist final (copiar pro commit message)
 
+- [ ] **Pre-flight check rodou e exportou `TENANT_DATA_ROOT`** (Docker está no maior volume, ≥50G livres)
 - [ ] DNS do `<DOMAIN>` resolvendo para o IP do servidor
 - [ ] Slot decidido e portas calculadas (App + DB + RTP se aplicável)
 - [ ] Credenciais geradas e salvas em `.local/build/<tenant>.credentials` (chmod 600)
 - [ ] Tarball gerado com `script/` incluído (validado com `tar tzf | grep script`)
-- [ ] Diretórios criados em `/opt/tenants/<tenant>` e `/nvme/tenants/<tenant>`
+- [ ] Diretórios criados em `/opt/tenants/<tenant>` e `$TENANT_DATA_ROOT/<tenant>`
 - [ ] Dockerfile + docker-compose.yml + .env subidos via SFTP (não heredoc)
 - [ ] `docker compose config` validou OK
 - [ ] Imagem buildada (~3GB)
