@@ -22,6 +22,7 @@ Skill para operar múltiplos clientes (tenants) em um único servidor dedicado, 
 - Deploy single-tenant (1 cliente = 1 VPS) → use `deploy-assistant-vps`
 - VPS com Asterisk nativo (não Docker) → use `voxcall-native-asterisk-deploy`
 - Configuração interna do Asterisk (dialplan, PJSIP) → use skills de Asterisk
+- **Tenant VoxZap (sem Asterisk, stack Node + Prisma + Postgres)** → use `voxzap-multitenant-install` (specialização desta skill, com SFTP-friendly templates, comando `prisma db push` correto, e bugs históricos do voxzap-locktec/voxzap-voxtel já mapeados). Esta skill aqui assume tenant VoxCALL com Asterisk.
 
 ## Modelo de Isolamento
 
