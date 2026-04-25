@@ -302,6 +302,14 @@ Quando o Asterisk para de enviar RTP (ex: entre áudios da URA), o gateway envia
 
 **IMPORTANTE**: `calling_voxcall_rtp_bind` deve ser o IP pelo qual o Asterisk consegue alcançar o servidor VoxZap. Se ambos estão na mesma rede, pode ser o IP interno. Se estão em redes diferentes, deve ser o IP público do VoxZap.
 
+**CRÍTICO — `calling_voxcall_extension` deve existir EXATAMENTE no dialplan**:
+- O gateway cria `Local/${extension}@${context}/n` via ARI Originate
+- Asterisk procura essa extensão **literalmente** no contexto
+- Se o dialplan tem `exten => 558532463838,1,...` (com código do país) e você configurar `extension=8532463838` (sem o `55`), o originate retorna sucesso (channel ID volta), mas a extensão não é achada → Local;2 morre imediatamente → Local;1 morre antes de entrar no Stasis → bridge fica só com ExternalMedia → **chamada sem áudio** com `astSilenceMs` crescendo indefinidamente
+- **Como validar**: na CLI do Asterisk rode `dialplan show <extension>@<context>` antes de cadastrar o setting
+- Quando a operadora usa o número completo no dialplan (`558532463838`, `551133334444`), o setting **DEVE** ter o `55` também
+- Quando a operadora usa apenas extensão curta (`s`, `1000`, `INBOUND`), use a extensão curta exatamente como está no dialplan
+
 ## Configuração do Asterisk (Pré-requisitos)
 
 ### 1. ARI habilitado (`/etc/asterisk/ari.conf`)
@@ -546,8 +554,80 @@ docker logs voxzap-app --since 5m 2>&1 | grep 'VoxCall-GW.*error\|VoxCall-GW.*fa
 **Causas comuns:**
 1. **ARI não conectado**: WebSocket ARI falhou. Verificar credenciais e conectividade
 2. **ExternalMedia não suportado**: Asterisk precisa do módulo `res_ari_external_media`
-3. **Local channel falha**: Contexto/extensão inexistente no dialplan
+3. **Local channel falha**: Contexto/extensão inexistente no dialplan (ver "Local channel nunca entra no Stasis" abaixo)
 4. **werift não carrega**: Pacote werift ou dependências faltando no container
+
+### Problema: Local channel nunca entra no Stasis (sintoma silencioso CLÁSSICO)
+
+**Sintoma característico** (validado em produção, abril 2026):
+- WebRTC OK: `ICE connection state: connected`, `dtls=connected`
+- ExternalMedia channel criado e adicionado ao bridge
+- Gateway loga `Local channel originated: 1777150412.14593` (originate retornou sucesso)
+- Mas **nunca** loga `StasisStart: channel=1777150412.14593` (Local channel não entra no Stasis app)
+- `astSilenceMs` cresce indefinidamente (5008, 10008, 15008, 20009...) — Asterisk silencioso porque o bridge está sem fonte de áudio do lado do dialplan
+- Na CLI do Asterisk com `core set verbose 5` **nem aparece** `Executing [<exten>@<context>:1]` — o Local;2 é destruído antes de executar qualquer priority
+- Resultado: chamada conecta, atende, mas **ninguém ouve nada** (nem URA, nem ramal)
+
+**Causa raiz (90% dos casos):**
+A extensão configurada em `calling_voxcall_extension` **não existe** no contexto `calling_voxcall_context` do dialplan.
+
+Quando `Local/<extension>@<context>/n` é originado:
+- Asterisk cria Local;1 (lado Stasis) e Local;2 (lado dialplan)
+- Local;2 tenta executar a extensão no contexto → não acha → hangup imediato
+- Local;1 é arrastado junto e morre **antes** de entrar no Stasis app
+- Como o originate já retornou o channel ID antes desse fluxo, o nosso código acha que deu certo
+- Asterisk não emite WARNING porque o hangup é "normal" do ponto de vista dele
+
+**Diagnóstico em 30 segundos:**
+
+1. Pegar a extensão e contexto configurados:
+   ```sql
+   SELECT key, value FROM "Settings" WHERE key IN ('calling_voxcall_extension', 'calling_voxcall_context') AND "tenantId"=<id>;
+   ```
+
+2. Na CLI do Asterisk, validar que a extensão existe **literalmente**:
+   ```
+   asterisk*CLI> dialplan show <extension>@<context>
+   ```
+   Se retornar `There is no existence of extension <extension> in context <context>` → essa é a causa.
+
+3. Listar todas as extensões do contexto pra achar a correta:
+   ```
+   asterisk*CLI> dialplan show <context>
+   ```
+
+4. Atualizar o setting com a extensão exata que existe (atenção a prefixo `55` do código do país, números completos vs. extensões curtas tipo `s`):
+   ```sql
+   UPDATE "Settings" SET value='<extensao_real>', "updatedAt"=NOW()
+   WHERE key='calling_voxcall_extension' AND "tenantId"=<id>;
+   ```
+
+5. **Não precisa reiniciar** o container — settings são lidos fresh por chamada via `loadConfig`.
+
+**Diagnóstico in-code (DIAG-LOCAL — adicionar quando suspeitar):**
+
+Logo após o `originate` do Local channel, agendar dois GETs via ARI pra ver se o canal ainda existe ou em qual priority parou:
+
+```typescript
+const localChannelIdForDiag = localChannel.id;
+const callIdForDiag = call_id;
+const configForDiag = config;
+setTimeout(async () => {
+  try {
+    const ch = await ariRequest(configForDiag, `/channels/${localChannelIdForDiag}`, "GET");
+    console.log(`[VoxCall-GW] DIAG-LOCAL ${callIdForDiag} @300ms: name=${ch.name}, state=${ch.state}, dialplan=${ch.dialplan?.context}/${ch.dialplan?.exten}@${ch.dialplan?.priority} (${ch.dialplan?.app_name})`);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[VoxCall-GW] DIAG-LOCAL ${callIdForDiag} @300ms: channel ${localChannelIdForDiag} GET failed (likely already destroyed): ${msg}`);
+  }
+}, 300);
+setTimeout(/* idem @1500ms */, 1500);
+```
+
+Interpretação:
+- `GET failed (404)` em ambos os timestamps = canal destruído (extensão inexistente / dialplan deu hangup)
+- `state=Up, dialplan=<ctx>/<exten>@<pri> (Stasis)` = canal saudável dentro do Stasis (problema é outro)
+- `state=Down` ou `dialplan` apontando pra app diferente de Stasis = bug de timing/handler
 
 ### Problema: Chamada termina após 30-60s
 
@@ -566,8 +646,12 @@ docker logs voxzap-app --since 5m 2>&1 | grep 'VoxCall-GW.*error\|VoxCall-GW.*fa
 | `DTMF RFC2833 START digit="X"` | DTMF detectado do WhatsApp |
 | `ARI DTMF injected digit="X"` | DTMF injetado no Asterisk com sucesso |
 | `DIAG: ice=connected, conn=connected, dtls=connected` | Conexão WebRTC saudável |
-| `astSilenceMs=N` | Tempo desde último pacote do Asterisk (< 20ms = normal) |
+| `astSilenceMs=N` | Tempo desde último pacote do Asterisk (< 20ms = normal; **crescendo monotônico = bridge sem fonte de áudio**) |
 | `Asterisk silent for Nms, starting silence keepalive` | Asterisk parou de enviar, keepalive ativado |
+| `Local channel originated: <id>` **sem** `StasisStart: channel=<id>` em ≤500ms | Local channel morreu antes do Stasis — extensão inexistente no dialplan (ver troubleshooting) |
+| `DIAG-LOCAL ... GET failed (likely already destroyed)` | Confirma que Local channel foi destruído pelo Asterisk após originate |
+| `StasisStart raced ahead — handler set local=X, originate returned Y` | Race condition rara entre originate response e StasisStart — fix #1 já trata, log informativo |
+| `orphan local channel will not produce audio` | StasisStart chegou para um Local channel sem bridge ativo — bug de timing, investigar |
 
 ## Dependências npm
 
@@ -637,6 +721,37 @@ if (voxcallConfig) {
 - Asterisk envia RTP para `calling_voxcall_rtp_bind:porta_udp` → pacotes nunca chegam ao container → `astSilenceMs` cresce indefinidamente
 - **Solução**: `network_mode: host` no container app — portas UDP ficam diretamente no host
 - **Impacto no nginx**: com `network_mode: host`, nginx não pode usar `http://app:5000` — deve usar `http://host.docker.internal:5000` com `extra_hosts: ["host.docker.internal:host-gateway"]`
+
+### Extensão do Dialplan Deve Casar Exatamente (Incidente Produção — Voxtel/Pharmavie, abril 2026)
+- Cliente Voxtel (tenant 1, ARI host `pharmavie.voxserver.app.br`) reportou chamadas WhatsApp sem áudio em ambos os lados
+- WebRTC, ICE, DTLS, ExternalMedia, bridge — tudo OK nos logs
+- ARI Originate retornava sucesso (channel ID `1777150412.14593`) mas StasisStart **nunca** disparava para esse channel
+- CLI do Asterisk com `core set verbose 5` mostrava só o ExternalMedia entrando no bridge, **sem nenhum** `Executing [...]` para o Local channel
+- Causa: setting `calling_voxcall_extension = 8532463838`, mas o dialplan tinha `exten => 558532463838,1,...` (com prefixo `55` do código do país)
+- Asterisk não achava `8532463838` em `[ENTRADA_OPERADORA]` → Local;2 morria → Local;1 morria sem entrar no Stasis
+- **Fix**: `UPDATE "Settings" SET value='558532463838' WHERE key='calling_voxcall_extension' AND "tenantId"=1`
+- Imediatamente após o UPDATE, próxima chamada caiu na URA (`URAPRINCIPAL`) com áudio perfeito; em seguida testado com Dial em ramal e áudio bidirecional funcionou
+- **Sem necessidade de reiniciar container** — `loadConfig()` lê settings do DB a cada chamada nova
+- Lição: SEMPRE validar `dialplan show <extension>@<context>` antes de cadastrar o setting; nunca assumir que o número "óbvio" é o que está no dialplan
+
+### Race Condition #1 — bridgeSession antes do Originate (Fix em commit 5e7acc0, abril 2026)
+- **Sintoma original**: em ambientes com Asterisk próximo (latência baixa), o evento `StasisStart` do Local channel chegava no nosso WebSocket ARI **antes** do `await ariRequest("/channels", "POST", ...)` resolver no Node
+- O handler de StasisStart procurava em `activeBridges.get(call_id)` mas a entrada ainda não tinha sido criada → o Local channel ficava órfão (sem `bridge.localChannelId` setado) e nunca era adicionado ao bridge
+- Resultado: bridge tinha só ExternalMedia, sem fonte de áudio do dialplan, mesmo sintoma do incidente acima
+- **Fix em `voxcall-calling-gateway.service.ts` linhas 916-945**:
+  1. Construir `bridgeSession` (com ariChannelId, bridgeId, rtpSocket, pc, etc.) **antes** do `await ariClient.channels.originate(...)`
+  2. `activeBridges.set(call_id, bridgeSession)` ANTES do originate
+  3. No `catch` do originate, `activeBridges.delete(call_id)` para evitar leak
+  4. Adicionar warning `orphan local channel will not produce audio` quando StasisStart chega para um channelId que não está em nenhuma bridge ativa
+- Mesmo se `localChannelId` for setado pelo handler antes do originate retornar, comparamos com o ID retornado e logamos `StasisStart raced ahead` (informativo)
+
+### Técnica DIAG-LOCAL para diagnosticar Local channels suspeitos
+- Quando suspeitar que um Local channel está morrendo silenciosamente, agendar `setTimeout(... GET /channels/{localId} ...)` em 300ms e 1500ms após o originate
+- Se ambos retornarem 404 → confirmação imediata de que o canal foi destruído (extensão inexistente é a causa #1)
+- Se retornarem `state=Up` com `dialplan.app_name=Stasis` → canal saudável, problema é outro (codec, RTP, firewall)
+- Se retornarem `state=Down` → canal nunca atendeu (raro)
+- Custo zero em produção: 2 GETs por chamada, ARI responde em ~5ms cada
+- Logs ficam visíveis em `docker logs <app>-app | grep DIAG-LOCAL`
 
 ## Referências Cruzadas com Outras Skills
 

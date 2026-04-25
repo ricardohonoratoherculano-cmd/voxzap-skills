@@ -34,6 +34,7 @@ scripts/clients/
   register.mjs    # cria/atualiza cliente (interativo + flags)
   list.mjs        # lista todos ou um cliente (senhas mascaradas)
   ssh.mjs         # executa comando via SSH e devolve JSON {stdout, stderr, exitCode}
+  upload.mjs      # SFTP-upload de arquivo grande (>>10KB) — USAR EM VEZ de base64 inline
   log.mjs         # adiciona acao ao historico (le JSON do stdin)
   search.mjs      # busca top-K acoes similares no historico
 
@@ -71,6 +72,52 @@ scripts/clients/
    ```
 
 Sempre logar quando: (a) descobrir algo novo, (b) executar mudança, (c) o usuário relatar/resolver problema.
+
+## Transferindo arquivos para a VPS (regra CRÍTICA)
+
+**Decisão rápida** — qual abordagem usar para mover um arquivo do Replit pra VPS?
+
+| Tamanho do arquivo | Ferramenta | Por quê |
+|---|---|---|
+| `≤ 8 KB` (~snippet, config curto) | `ssh.mjs` com heredoc ou base64 inline | Cabe no `argv` |
+| `> 8 KB` (qualquer fonte TS/JS/JSON real) | **`upload.mjs` (SFTP)** | `argv` estoura ("Argument list too long") |
+
+### ✅ Forma correta para arquivos grandes
+
+```bash
+node scripts/clients/upload.mjs <slug> <localPath> <remotePath>
+# ex:
+node scripts/clients/upload.mjs voxzap-voxtel \
+  server/services/uazapi.service.ts \
+  /opt/tenants/voxzap-voxtel/source/server/services/uazapi.service.ts
+# saída: {"ok":true,"bytes":14518,"remotePath":"..."}
+```
+
+`upload.mjs` usa o canal SFTP do `ssh2` (que reusa a mesma autenticação do cofre AES-256-GCM), sem prompt de senha, sem limite de argv.
+
+### ❌ Anti-padrões (NÃO repetir)
+
+```bash
+# ❌ scp direto — pede senha interativa, quebra os scripts não-tty
+scp -P 22300 file root@host:/path           # → "password:" prompt → travamento
+
+# ❌ base64 inline em arg — estoura para arquivos > ~8 KB
+B64=$(base64 -w 0 file_grande.ts)
+node scripts/clients/ssh.mjs slug "echo '$B64' | base64 -d > /path"
+# → "Argument list too long" (exit code 126)
+
+# ❌ heredoc via ssh.mjs — escape de aspas/dolar fica intratável
+node scripts/clients/ssh.mjs slug "cat > /path <<'EOF'
+... conteúdo com aspas e $vars ...
+EOF"
+# → frágil, qualquer aspa no source vira shell injection
+```
+
+### Limites operacionais
+
+- `ssh.mjs` tem `SSH_TIMEOUT_MS=60000` por padrão. Para builds Docker (>2 min), aumente:
+  `SSH_TIMEOUT_MS=180000 node scripts/clients/ssh.mjs slug 'docker compose up -d --build app'`
+- Mesmo se o `SSH_TIMEOUT_MS` estourar, o comando **continua rodando na VPS**. Pra confirmar, faça uma segunda chamada `ssh.mjs slug "docker ps"`.
 
 ## Cadastrar novo cliente
 

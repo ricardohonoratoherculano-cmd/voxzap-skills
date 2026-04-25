@@ -29,7 +29,7 @@ Skill para desenvolvimento e manutenção de todos os canais de comunicação do
 | `messenger` | Messenger | Azul | `messenger.service.ts` | Webhook Meta |
 | `webchat` | WebChat | Roxo | `socket.ts` (namespace /webchat) | Socket.io |
 | `email` | E-mail | Amber | `email.service.ts` | IMAP Polling |
-| `uazapi` | UazAPI | Cinza | `whatsapp.service.ts` | Webhook UazAPI |
+| `uazapi` | UazAPI | Cinza | `whatsapp.service.ts` | Webhook UazAPI (ver skill **`uazapi-expert`** para spec OpenAPI completo, gotchas LID vs chatid, endpoints unificados `/send/media`, etc.) |
 
 ## Arquitetura Geral
 
