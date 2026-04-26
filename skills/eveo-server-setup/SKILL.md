@@ -345,7 +345,7 @@ smartctl -A /dev/nvme0n1 | grep -E 'Available Spare|Percentage Used|Power_On_Hou
 
 | Hostname | SSH | Clientes (slot) | Data setup | Observações |
 |---|---|---|---|---|
-| `eveo1.voxserver.app.br` | porta 22300 | Planoclin/VoxCall (slot 1) + voxzap-locktec (slot 2) + voxzap-voxtel (slot 3) + Voxtel-IO Hub | 2026-04 | Migração SSD→NVMe feita 2026-04-22 22:46. 8 vCPU, 8GB RAM. Multi-tenant. voxzap-voxtel adicionado 2026-04-24 (8g/8cpu, dados em /nvme/tenants/voxzap-voxtel/, domínio voxtel.voxzap.cc). |
+| `eveo1.voxserver.app.br` | porta 22300 | Planoclin/VoxCall (slot 1) + voxzap-locktec (slot 2) + voxzap-voxtel (slot 3) + voxtel-cc (slot 4, site institucional) + Voxtel-IO Hub | 2026-04 | Migração SSD→NVMe feita 2026-04-22 22:46. 8 vCPU, 8GB RAM. Multi-tenant. voxzap-voxtel adicionado 2026-04-24 (8g/8cpu, dados em /nvme/tenants/voxzap-voxtel/, domínio voxtel.voxzap.cc). voxtel-cc adicionado 2026-04-25 (PHP estático + nginx, 256m/0.5cpu, domínio voxtel.cc, ver skill `site-voxtel`). |
 
 Adicione novos servidores aqui conforme forem provisionados. **Sempre marcar se foi feito setup correto desde o início OU se foi migração corretiva.**
 
