@@ -678,6 +678,94 @@ model TicketEvaluations {
 
 **Proteção contra race condition:** O `prisma.ticketEvaluations.create()` está envolvido em try/catch que detecta erro Prisma P2002 (unique violation). Se duas mensagens de avaliação chegarem simultaneamente, a segunda é tratada como sucesso (sem erro para o cliente) em vez de criar duplicata.
 
+#### Marcador "skipped" — Fechamento Forçado Sem Avaliação
+
+Quando o operador fecha um ticket pelo **X vermelho do card** (atendimento) ou pelo **bulk-close do painel admin**, NÃO queremos enviar a pesquisa nem queremos que a próxima mensagem do cliente caia no `handleEvaluationResponse`.
+
+**Problema histórico:** Sem nenhum marcador, `handleEvaluationResponse` continuava interceptando toda mensagem do contato dentro de `ratingStoreTime` (1h padrão), mandando "Resposta inválida" → "Você tem mais uma oportunidade..." → "Número máximo de tentativas atingido", mesmo o ticket tendo sido encerrado SEM cobrança de pesquisa.
+
+**Solução:** Gravar uma linha em `TicketEvaluations` com `evaluation: "skipped"` e `attempts: 0`. Como `handleEvaluationResponse` já checa `existingEvalCheck` e retorna `false` se houver qualquer linha pra aquele ticket, o marcador silencia o fluxo de cobrança permanentemente para aquele encerramento.
+
+**Backend** (`server/routes.ts`):
+
+```ts
+// PATCH /api/tickets/:id — schema aceita skipEvaluation
+const updateTicketSchema = z.object({
+  status: z.enum(["pending", "open", "closed"]).optional(),
+  // ... outros campos
+  skipEvaluation: z.boolean().optional(),
+});
+
+// Após o updatedTicket + broadcast, ANTES do bloco de envio de pesquisa:
+if (status === "closed" && skipEvaluation === true && ticket.whatsappId) {
+  try {
+    await prisma.ticketEvaluations.create({
+      data: {
+        ticketId,
+        tenantId: req.user.tenantId,
+        userId: req.user.userId,
+        evaluation: "skipped",
+        attempts: 0,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
+  } catch (skipErr: any) {
+    if (skipErr?.code !== "P2002") console.error("...", skipErr);
+  }
+}
+
+// O bloco de envio de pesquisa (sendEvaluation) também checa skipEvaluation:
+if (status === "closed" && ticket.whatsappId && resolveContactRecipient(ticket.contact)) {
+  if (skipEvaluation) {
+    // pula tudo: não envia farewellMessage nem pesquisa
+  } else {
+    // envia farewell + pesquisa normalmente
+  }
+}
+
+// POST /api/tickets/bulk-close — busca IDs antes do updateMany e cria markers
+const ticketsToClose = await prisma.tickets.findMany({
+  where, select: { id: true, whatsappId: true, userId: true },
+});
+await prisma.tickets.updateMany({ where, data: { status: "closed", ... } });
+const evalMarkers = ticketsToClose
+  .filter((t) => t.whatsappId)
+  .map((t) => ({
+    ticketId: t.id,
+    tenantId: req.user.tenantId,
+    userId: t.userId ?? req.user.userId,
+    evaluation: "skipped",
+    attempts: 0,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  }));
+if (evalMarkers.length > 0) {
+  await prisma.ticketEvaluations.createMany({ data: evalMarkers, skipDuplicates: true });
+}
+```
+
+**Frontend** (`client/src/pages/atendimento.tsx`):
+
+```ts
+// X vermelho do card passa skipEvaluation=true
+const handleCloseTicket = (ticket: Ticket, skipEvaluation = false) => {
+  updateTicketMutation.mutate({ id: ticket.id, status: "closed", skipEvaluation });
+};
+// X vermelho:
+<button onClick={() => handleCloseTicket(ticket, true)}>X</button>
+// Botão de "Finalizar com pesquisa" no topbar: handleCloseTicket(ticket, false)
+```
+
+**Correção retroativa de tickets já fechados sem marker:** Se o usuário reportar "cliente continua recebendo cobrança de pesquisa", inserir manualmente:
+
+```sql
+INSERT INTO "TicketEvaluations"
+  ("evaluation", "attempts", "ticketId", "userId", "tenantId", "createdAt", "updatedAt")
+VALUES ('skipped', 0, <ticket_id>, <user_id>, <tenant_id>, NOW(), NOW())
+ON CONFLICT ("ticketId", "tenantId") DO NOTHING;
+```
+
 #### Código-Chave
 
 - **Envio ao fechar:** `server/routes.ts` → `PATCH /api/tickets/:id` (bloco `if status === "closed"`)
@@ -788,6 +876,7 @@ O endpoint `POST /api/new-conversation`, quando recebe um `contactId` de contato
 | `POST /api/contacts` | Criar novo contato (name, number, email, tenantId) |
 | `GET /api/contacts/:id` | Detalhes do contato com ContactWallets, ContactTags, ContactCustomFields |
 | `PUT /api/contacts/:id` | Atualizar contato |
+| `DELETE /api/contacts/:id` | Excluir contato + cascateia tickets, mensagens, anotações etc. (ver "Exclusão de Contato") |
 | `GET /api/contacts/:id/messages` | Histórico de mensagens do contato (paginado, todas as fontes) |
 | `GET /api/contacts/export` | Exportar CSV com BOM (Excel-compatible) |
 | `POST /api/contacts/check-ninth-digit` | Verificar/adicionar 9° dígito em números brasileiros |
@@ -807,6 +896,107 @@ A busca (`search` query param) pesquisa em: `name`, `number`, `email`, `pushname
 ### IMPORTANTE - Ordem de Rotas no Express
 
 Rotas estáticas (`/api/contacts/export`, `/api/contacts/check-ninth-digit`, etc.) e `POST /api/contacts` DEVEM ser registradas ANTES de `/api/contacts/:id` para evitar que Express interprete "export" como um `:id`.
+
+### Exclusão de Contato (DELETE /api/contacts/:id)
+
+Excluir um contato é **destrutivo total**: remove o contato em si E todo o histórico vinculado (tickets, mensagens, anotações, campanhas, etiquetas, custom fields, transcrições, summaries de IA, etc.).
+
+#### Mapa de FKs de `Contacts` → relações
+
+A maioria dos modelos referencia `Contacts` com `onDelete: Cascade` e cascateia automaticamente:
+- `Tickets` (Cascade) → cujos children também cascateiam: `Messages`, `MessagesOffLine`, `LogTickets`, `MessageUpserts`, `TicketActionLogs`, `TicketShareds`, `TicketParticipants`, `OperatorKanbanTickets`
+- `BirthdayMessagesSents`, `CampaignContacts`, `ContactCustomFields`, `ContactTags`, `ContactUpserts`, `ContactWallets`, `Messages`(direto), `MessagesOffLine`(direto), `Opportunitys` — todos Cascade
+
+Modelos que apontam pra `Contacts` (ou pra `Tickets` filhos) com **`Restrict`** (default ou explícito) **bloqueiam o delete** se não forem limpos antes:
+- `AutoReplyLogs.contactId` (Restrict)
+- `AutoReplyLogs.ticketId` (default = Restrict)
+- `UserMessagesLog.ticketId` (default = Restrict)
+- `CallTranscriptions.contactId` (default = Restrict, relation field `contact`)
+- `InteractionSummaries.contactId` (default = Restrict, relation field `contact`)
+
+#### Padrão correto do endpoint
+
+```ts
+app.delete("/api/contacts/:id", authenticateToken, async (req: any, res) => {
+  try {
+    const tenantId = req.user.tenantId;
+    const id = parseInt(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ message: "ID inválido" });
+
+    const contact = await prisma.contacts.findFirst({
+      where: { id, tenantId }, select: { id: true, name: true },
+    });
+    if (!contact) return res.status(404).json({ message: "Contato nao encontrado" });
+
+    await prisma.$transaction(async (tx) => {
+      const tickets = await tx.tickets.findMany({
+        where: { contactId: id, tenantId }, select: { id: true },
+      });
+      const ticketIds = tickets.map((t) => t.id);
+
+      // Restrict FKs em Tickets — limpar antes do cascade
+      if (ticketIds.length > 0) {
+        await tx.userMessagesLog.deleteMany({ where: { ticketId: { in: ticketIds } } });
+        await tx.autoReplyLogs.deleteMany({ where: { ticketId: { in: ticketIds } } });
+      }
+      // Restrict FKs em Contacts
+      await tx.callTranscriptions.deleteMany({ where: { contactId: id } });
+      await tx.interactionSummaries.deleteMany({ where: { contactId: id } });
+      await tx.autoReplyLogs.deleteMany({ where: { contactId: id } });
+
+      // Agora seguro — cascade cuida do resto
+      await tx.contacts.delete({ where: { id } });
+    }, { timeout: 60000, maxWait: 5000 });
+
+    return res.json({ success: true, message: "Contato excluído" });
+  } catch (error) {
+    console.error("[Contacts] Delete error:", error);
+    return res.status(500).json({ message: "Erro ao excluir contato" });
+  }
+});
+```
+
+**Sempre** elevar o timeout do `$transaction` para contatos com muitos tickets/mensagens — o default de 5s estoura facilmente em base grande (Locktec tem contatos com 1k+ mensagens).
+
+### Ações na Tabela de Contatos (Frontend)
+
+Em `client/src/pages/contatos.tsx` cada linha tem 4 ícones na coluna "Ações", todos envolvidos em `<Tooltip>` (o `TooltipProvider` é global em `App.tsx`, não precisa wrap local):
+
+| Ícone | Tooltip | Ação |
+|-------|---------|------|
+| `Eye` | "Ver informações" | `setSelectedContactId(contact.id)` — abre painel lateral de detalhes |
+| `Edit` | "Editar contato" | `handleOpenEdit(contact.id)` — abre dialog de edição |
+| `Ban` (verde se bloqueado, vermelho caso contrário) | "Bloquear contato" / "Desbloquear contato" | `blockMutation.mutate(...)` |
+| `Trash2` (vermelho) | "Excluir contato" | `setDeleteContactTarget({ id, name })` — abre `AlertDialog` de confirmação |
+
+**Padrão de confirmação (AlertDialog):** o delete usa um state `deleteContactTarget` separado do state genérico `confirmAction` (que é usado pra ações em massa como "Remover Duplicados"). O AlertDialog tem botão "Excluir" em vermelho (`bg-red-600 hover:bg-red-700`), e a `AlertDialogCancel` fica desabilitada enquanto `deleteContactMutation.isPending`.
+
+```tsx
+<AlertDialog
+  open={!!deleteContactTarget}
+  onOpenChange={(open) => { if (!open && !deleteContactMutation.isPending) setDeleteContactTarget(null); }}
+>
+  <AlertDialogContent data-testid="dialog-delete-contact">
+    <AlertDialogHeader>
+      <AlertDialogTitle>Excluir contato?</AlertDialogTitle>
+      <AlertDialogDescription>
+        Tem certeza que deseja excluir <strong>{deleteContactTarget?.name}</strong>?
+        Esta ação remove o contato e todos os dados vinculados ... e não pode ser desfeita.
+      </AlertDialogDescription>
+    </AlertDialogHeader>
+    <AlertDialogFooter>
+      <AlertDialogCancel disabled={deleteContactMutation.isPending}>Cancelar</AlertDialogCancel>
+      <AlertDialogAction
+        onClick={() => deleteContactTarget && deleteContactMutation.mutate(deleteContactTarget.id)}
+        disabled={deleteContactMutation.isPending}
+        className="bg-red-600 hover:bg-red-700 focus:ring-red-600"
+      >
+        Excluir
+      </AlertDialogAction>
+    </AlertDialogFooter>
+  </AlertDialogContent>
+</AlertDialog>
+```
 
 ## Tickets
 
