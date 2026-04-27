@@ -1437,6 +1437,81 @@ Body: { components: [...] }
 DELETE /{version}/{wabaId}/message_templates?name={templateName}
 ```
 
+### Rotas Internas (Multi-Canal WABA)
+
+Cada cliente pode ter **N conexões WABA** ao mesmo tempo (ex: WABA principal + WABA secundário com outro número). As rotas internas aceitam `whatsappId` opcional e roteiam para o WABA correto via `templateService.getConnectionForTemplates(tenantId, whatsappId)`.
+
+| Rota | Onde vai `whatsappId` | Quando obrigatório |
+|------|----------------------|--------------------|
+| `GET /api/templates?whatsappId=N` | Query string | Opcional — sem ele pega o **primeiro WABA com `status=CONNECTED`** (`findFirst`) |
+| `POST /api/templates` | Body | Opcional — mesma fallback |
+| `PUT /api/templates/:id` | Body | Opcional — mesma fallback |
+| `DELETE /api/templates/:name?whatsappId=N` | Query string | Opcional — mesma fallback |
+
+```ts
+// server/services/template.service.ts → getConnectionForTemplates()
+const where: any = { tenantId, type: "waba", isDeleted: false, isActive: true,
+                     wabaId: { not: null }, bmToken: { not: null } };
+if (whatsappId) where.id = whatsappId;
+else where.status = "CONNECTED";
+return prisma.whatsapps.findFirst({ where, select: { id, wabaId, bmToken, wabaVersion, name } });
+```
+
+#### Armadilha: cliente "não vê todos os templates"
+
+Se o cliente reporta que faltam templates na tela, **quase sempre** é porque tem mais de uma conexão WABA cadastrada e a tela só estava puxando do primeiro `CONNECTED` (sem filtro de canal). Os templates "sumidos" são na verdade de outro `wabaId`. Solução: confirmar quantos canais WABA o tenant tem e usar o seletor de canal na tela (ver Frontend Multi-Canal abaixo).
+
+### Tela de Templates (Frontend Multi-Canal)
+
+`client/src/pages/templates.tsx` precisa rotear todas as chamadas para o canal WABA selecionado:
+
+```tsx
+// 1. Carrega lista de canais WABA
+const { data: whatsappsData } = useQuery<{ connections: Array<{
+  id: number; name: string; type: string; status: string; wabaId: string | null;
+}> }>({ queryKey: ["/api/whatsapps"] });
+
+const wabaChannels = (whatsappsData?.connections || []).filter(c => c.type === "waba" && c.wabaId);
+
+// 2. State + auto-select do primeiro CONNECTED (fallback: primeiro da lista)
+const [selectedWhatsappId, setSelectedWhatsappId] = useState<number | null>(null);
+useEffect(() => {
+  if (selectedWhatsappId !== null || wabaChannels.length === 0) return;
+  const firstConnected = wabaChannels.find(c => c.status === "CONNECTED");
+  setSelectedWhatsappId((firstConnected || wabaChannels[0]).id);
+}, [wabaChannels, selectedWhatsappId]);
+
+// 3. Query principal: queryKey inclui o whatsappId, enabled aguarda auto-select
+const { data } = useQuery<TemplatesResponse>({
+  queryKey: ["/api/templates", { whatsappId: selectedWhatsappId ?? undefined }],
+  enabled: selectedWhatsappId !== null,
+});
+
+// 4. Mutations passam whatsappId:
+//    POST/PUT → no body: { ..., whatsappId: selectedWhatsappId }
+//    DELETE  → na URL: `/api/templates/${name}?whatsappId=${selectedWhatsappId}`
+
+// 5. Topbar tem o <Select> de canal (só renderiza se >0 canais):
+{wabaChannels.length > 0 && (
+  <Select value={String(selectedWhatsappId)} onValueChange={(v) => setSelectedWhatsappId(parseInt(v))}>
+    <SelectTrigger data-testid="select-waba-channel"><SelectValue placeholder="Canal WABA" /></SelectTrigger>
+    <SelectContent>
+      {wabaChannels.map(c => (
+        <SelectItem key={c.id} value={String(c.id)}>
+          {c.name}{c.status !== "CONNECTED" && " (desconectado)"}
+        </SelectItem>
+      ))}
+    </SelectContent>
+  </Select>
+)}
+```
+
+**Pontos críticos:**
+- O `queryKey: ["/api/templates", { whatsappId: ... }]` aproveita o `getQueryFn` global (`client/src/lib/queryClient.ts` linha 124) que serializa o segundo elemento do array como query string automaticamente. Por isso NÃO precisa montar URL manualmente nem definir `queryFn` próprio.
+- `enabled: selectedWhatsappId !== null` evita um fetch sem filtro antes do auto-select acontecer (que pegaria do primeiro CONNECTED no backend e depois recarregaria — flicker).
+- Na invalidação `queryClient.invalidateQueries({ queryKey: ["/api/templates"] })` o React Query usa **prefix match** por padrão, então invalida todas as variantes (todos os canais), o que é o desejado quando uma mutation acontece em um canal específico.
+- Canais desconectados também aparecem no dropdown (com sufixo "(desconectado)") porque o `wabaId` continua válido — útil pra ver/limpar templates de canais desativados.
+
 ### Envio de Template
 
 ```typescript
