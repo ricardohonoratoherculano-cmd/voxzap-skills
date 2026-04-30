@@ -1020,17 +1020,28 @@ O dialplan então roda `AMD()`, branch `HUMAN`/`MACHINE`, e só cai em `Queue(..
 
 **UI**: aba colapsável "Roteamento Asterisk" no modal de criar/editar campanha em `client/src/pages/dialer-campaigns.tsx`, **renderizada APENAS** quando `useAuth().user.role === 'superadmin'`. Inclui radio queue/dialplan, inputs Context/Exten, lista key/value de variáveis com botão "+", e preview do Originate.
 
+**Schemas Zod (PADRÃO p/ schemas com `.superRefine` e PUT)**:
+Schemas que terminam em `.superRefine(...)` viram `ZodEffects`, que **NÃO tem `.partial()`**. Em runtime, `schema.partial()` retorna `undefined` e qualquer PUT que use `.partial().parse(body)` quebra com `TypeError`. Padrão correto:
+```ts
+const baseSchema = createInsertSchema(table).omit({...}).extend({...});
+const refinement = (data, ctx) => { /* ... */ };
+export const insertSchema = baseSchema.superRefine(refinement);
+export const updateSchema = baseSchema.partial().superRefine(refinement);
+```
+Use `insertSchema` no POST e `updateSchema` no PUT. Valido para `dialerCampaigns` (em `shared/schema.ts`) e qualquer schema futuro com refinements multi-campo.
+
 **Defesas de segurança (CRÍTICO — AMI protocol injection)**:
-1. **Zod backend** em `shared/schema.ts` `insertDialerCampaignSchema`:
+1. **Zod backend** em `shared/schema.ts` `insertDialerCampaignSchema` + `updateDialerCampaignSchema`:
    - `originateMode`: enum `["queue", "dialplan"]`
-   - `dialplanContext`/`dialplanExten`: regex `^[A-Za-z0-9_-]{1,64}$`
-   - `dialplanVariables`: keys via `^[A-Za-z_][A-Za-z0-9_()]{0,63}$`, values sem `\r\n`, máx 500 chars
+   - `dialplanContext`/`dialplanExten`: regex `AMI_SAFE_TOKEN = /^[A-Za-z0-9_-]{1,64}$/`
+   - `dialplanVariables`: keys via `AMI_VAR_NAME = /^[A-Za-z_][A-Za-z0-9_()]{0,63}$/`, values sem `\r\n`, máx 500 chars
    - `superRefine`: se mode=dialplan, context+exten obrigatórios
 2. **Guard server-side** em `server/routes.ts` `stripDialplanFieldsIfNotSuperAdmin()`: nas rotas POST/PUT `/api/dialer/campaigns`, se `req.user.role !== 'superadmin'`, os 4 campos são removidos do body antes do parse — impossibilita escalation por API direta.
 3. **Defesa em profundidade no engine** `sanitizeAmiToken()`: re-aplica regex `^[A-Za-z0-9_-]{1,64}$` em `dialplanContext`/`dialplanExten` antes de escrever no socket AMI; aborta o originate se algo passou.
 4. **`escapeAmiVarValue()`**: remove `\r\n,` dos values e trunca a 200 chars antes de juntar via `,`.
+5. **GLOBAL no `amiOriginate()`** em `server/dialer-engine.ts`: substitui `\r\n` por espaço em **TODOS** os values do payload antes de escrever no socket. Cobre `Channel`, `CallerID` (record.name), `Data` (queueName), `ActionID`, `Variable`, etc. Esta é a última linha de defesa universal — qualquer string que passe pelo `amiOriginate()` está protegida, mesmo sem sanitização específica do chamador.
 
-**Padrão para futuras adições no AMI Originate**: NUNCA passe valor de input do usuário direto pra `Context`/`Exten`/`Channel` sem sanitização. AMI é protocolo line-based — `\r\n` em qualquer field permite injetar `Action: Hangup` ou outros comandos.
+**Padrão para futuras adições no AMI Originate**: o `amiOriginate()` global remove CRLF de tudo, mas para defesa em camadas continue validando inputs específicos no Zod e re-validando tokens críticos (Context/Exten) antes do socket. AMI é protocolo line-based.
 
 ### Bugs corrigidos (2026-03-26/27)
 
