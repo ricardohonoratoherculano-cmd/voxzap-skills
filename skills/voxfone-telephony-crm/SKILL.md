@@ -1353,7 +1353,8 @@ docker exec voxfone-db psql -U voxfone -d voxfone -c "ALTER USER voxfone WITH PA
 - **Copy-to-clipboard**: Telefone, Cód.Gravação, and Protocolo fields in the status table are clickable when they have a value — copies to clipboard with toast feedback ("Telefone copiado!" etc.). Cursor changes to pointer and text highlights blue on hover
 - **Change password**: KeyRound button in bottom bar opens Dialog with current/new/confirm password fields, show/hide toggles. `POST /api/agent/change-password` reads from REPLICA, writes to PRIMARY `agentes_tela`
 - **Consult-cancel (Retornar Consulta)**: PhoneIncoming button (emerald green) between Consultar and Desligar. `POST /api/agent/consult-cancel` finds the `Local/...;1` channel in the operator's ARI bridge and does AMI `Hangup` on it — this cancels the Atxfer consultation and Asterisk seamlessly returns the operator to the original client without re-ringing the operator's extension. Important: do NOT hangup the operator's PJSIP channel (that causes re-ring)
-- **Transfer/Hangup cleanup**: Both `POST /api/agent/transfer` and `POST /api/agent/hangup` fire-and-forget `DELETE FROM t_monitor_voxcall WHERE ramal = $1` via `withExternalPg` after the main action to prevent stale dashboard data
+- **Transfer/Hangup cleanup**: Both `POST /api/agent/transfer` and `POST /api/agent/hangup` fire-and-forget `DELETE FROM t_monitor_voxcall WHERE ramal = $1` via `withExternalPg` after the main action to prevent stale dashboard data. **`POST /api/agent/transfer-satisfacao` (Pesquisa de Satisfação) intentionally does NOT delete** — the Postgres trigger `trg_enriquece_pesquisa_satisfacao` reads that row to enrich the survey insert.
+- **CRITICAL — Blind transfer channel discovery (do NOT use `t_monitor_voxcall.canal` for AMI Redirect)**: For dialer-originated calls (`Originate Local/{phone}@MANAGER` + `Application=Queue`), the channel name stored in `t_monitor_voxcall.canal` is `Local/...;1` — the **internal Local Channel side pointing back into the dialer's Manager dialplan**, NOT the external client trunk. Doing `AMI Redirect` on that side leaves the customer leg orphaned and the call drops. **Always discover the real client channel via ARI** using the helper `findClientChannelForRamal(ramal)` in `server/routes.ts` (defined ~line 2351): it lists `/channels` + `/bridges`, finds the operator channel (`PJSIP/{ramal}-...` state=Up), gets the bridge peer; if peer is a Local channel (`;1`/`;2`) it walks to the sibling (replace `;1`↔`;2`), gets the peer in the sibling's bridge, repeats up to depth 4, and returns the first non-Local channel (the actual PJSIP/SIP/IAX trunk leg of the customer). Both `POST /api/agent/transfer` and `POST /api/agent/transfer-satisfacao` use this helper.
 
 ### Tabs
 | Tab | Description |
@@ -1436,7 +1437,8 @@ The `/api/cdr/audio/:uniqueid` endpoint accepts BOTH user sessions (`req.session
 | POST | `/api/agent/dial` | agentAuth | ARI Originate call (context: MANAGER) |
 | POST | `/api/agent/answer` | agentAuth | ARI answer ringing channel |
 | POST | `/api/agent/hangup` | agentAuth | ARI DELETE channel + fire-and-forget DELETE from `t_monitor_voxcall` |
-| POST | `/api/agent/transfer` | agentAuth | AMI Redirect (blind transfer) + fire-and-forget DELETE from `t_monitor_voxcall` |
+| POST | `/api/agent/transfer` | agentAuth | Blind transfer — `findClientChannelForRamal(ramal)` (ARI) + AMI `Redirect` to `Context: MANAGER` + fire-and-forget DELETE from `t_monitor_voxcall`. Does NOT use `t_monitor_voxcall.canal` (would drop dialer calls) |
+| POST | `/api/agent/transfer-satisfacao` | agentAuth | Blind transfer to `*100@MANAGER` (Pesquisa de Satisfação URA) — same `findClientChannelForRamal` helper. Does NOT delete from `t_monitor_voxcall` (trigger `trg_enriquece_pesquisa_satisfacao` needs the row) |
 | POST | `/api/agent/consult` | agentAuth | AMI Atxfer (attended transfer) |
 | POST | `/api/agent/consult-cancel` | agentAuth | Cancel Atxfer consultation — finds Local channel in operator's bridge via ARI, AMI Hangup on it |
 | POST | `/api/agent/change-password` | agentAuth | Change operator password (reads REPLICA, writes PRIMARY `agentes_tela`) |
@@ -1569,7 +1571,8 @@ The `/api/cdr/audio/:uniqueid` endpoint accepts BOTH user sessions (`req.session
 | `GET /api/agent/calls/recordings` | REPLICA | SELECT | `cdr` |
 | `GET /api/agent/pause-reasons` | REPLICA | SELECT | `pausas` |
 | `GET /api/agent/script` | REPLICA | SELECT | `scripts_atendimento` |
-| `POST /api/agent/transfer` | REPLICA+PRIMARY | SELECT (canal lookup) + DELETE | `t_monitor_voxcall` |
+| `POST /api/agent/transfer` | PRIMARY | DELETE (fire-and-forget after Redirect) | `t_monitor_voxcall` (channel discovery via ARI, NOT DB) |
+| `POST /api/agent/transfer-satisfacao` | — | (no DB write — survey trigger needs the row) | ARI+AMI only |
 | `POST /api/agent/hangup` | PRIMARY | DELETE (fire-and-forget) | `t_monitor_voxcall` |
 | `POST /api/agent/consult-cancel` | — | ARI list channels/bridges + AMI Hangup | (no DB, ARI+AMI only) |
 | `POST /api/agent/change-password` | REPLICA+PRIMARY | SELECT + UPDATE | `agentes_tela` |
@@ -1725,7 +1728,7 @@ These tables are replicated from PRIMARY to REPLICA via PostgreSQL logical repli
 - **ARI vs AMI**: ARI para originar/listar/desligar canais. AMI (porta 25038, TCP) para transferências (Redirect = cega, Atxfer = assistida) porque canais de call center NÃO estão em Stasis
 - **AMI helper**: Função `amiAction()` em `server/routes.ts` — usa `loadAmiConfig()` para ler `ami-config.json` (fallback: host do ARI + porta 25038 + user primax). Conecta TCP, login, executa ação, logoff. Banner AMI termina com `\r\n` simples (não `\r\n\r\n`)
 - **AMI config UI**: Seção na página Configurações (`settings.tsx`) logo abaixo da ARI. Campos: Host, Porta (default 25038), Usuário, Senha. Endpoints: `GET/PUT /api/ami/config` (arquivo `ami-config.json`), `POST /api/ami/test` (testa Login/Logoff via socket TCP)
-- **Transfer cega**: Busca canal do tronco na `t_monitor_voxcall` (coluna `canal`) + AMI `Redirect` com `Context: MANAGER`
+- **Transfer cega**: USAR `findClientChannelForRamal(ramal)` (helper em `server/routes.ts` ~L2351) que descobre o canal real do cliente via ARI atravessando bridges + Local channel pairs (;1↔;2) + AMI `Redirect` com `Context: MANAGER`. NÃO usar a coluna `canal` da `t_monitor_voxcall` (em chamadas do dialer ela aponta para `Local/...;1` interno e o AMI `Redirect` derruba o cliente). Mesmo padrão para `/api/agent/transfer-satisfacao` (URA `*100@MANAGER`)
 - **Transfer assistida (Consulta)**: Busca canal do operador via `findChannelByRamal` + AMI `Atxfer` com `Context: MANAGER` — espera, liga destino, transfere ao desligar
 - SQL in routes.ts: Use string concatenation (`+`), NEVER template literals (`${}`) in large SQL queries — esbuild silently truncates class methods
 - **DB Routing**: See "Database Routing Map" section above for complete PRIMARY vs REPLICA mapping per endpoint

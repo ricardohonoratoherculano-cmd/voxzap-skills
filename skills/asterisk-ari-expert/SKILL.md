@@ -48,9 +48,14 @@ await ariRequest('/channels', 'POST', {
 });
 
 // AMI — Transferência cega (CORRETO)
+// IMPORTANTE: NÃO usar o canal salvo em t_monitor_voxcall.canal!
+// Em chamadas do dialer (Originate Local + Queue) ele aponta para
+// Local/...;1 (lado interno), e o Redirect derruba o cliente.
+// Sempre descobrir o canal real do cliente via ARI:
+const clientChannel = await findClientChannelForRamal(ramal);
 await amiAction({
   Action: 'Redirect',
-  Channel: canalName,
+  Channel: clientChannel.name,  // tronco PJSIP/SIP/IAX externo do cliente
   Exten: destino,
   Context: 'MANAGER',  // SEMPRE MANAGER
   Priority: '1'
@@ -85,7 +90,7 @@ await amiAction({
 | Listar canais | ARI | Consulta simples |
 | Desligar canal | ARI | DELETE funciona em qualquer canal |
 | Atender canal | ARI | POST answer funciona |
-| Transferência cega | AMI (`Redirect`) | Canal fora do Stasis |
+| Transferência cega | AMI (`Redirect`) + ARI (descoberta de canal) | Canal fora do Stasis; canal alvo descoberto via ARI bridges (`findClientChannelForRamal`) — nunca usar `t_monitor_voxcall.canal` cru |
 | Transferência assistida | AMI (`Atxfer`) | Canal fora do Stasis |
 | Spy/Whisper/Conference | ARI | Originate via dialplan |
 | Pausar/Despausar operador | DB | Tabela monitor_operador |
@@ -575,7 +580,8 @@ Protegidos por `requireAgentAuth`. O ramal vem de `req.session.agentSession.rama
 |----------|------|-----------|---------------|
 | `POST /api/agent/dial` | Discar | ARI | ARI Originate: `POST /channels` com `endpoint: PJSIP/{ramal}`, `extension: {destino}`, `context: MANAGER`, `priority: 1` |
 | `POST /api/agent/answer` | Atender | ARI | `findChannelByRamal` (estado Ringing) + `POST /channels/{channelId}/answer` |
-| `POST /api/agent/transfer` | Transferência cega | AMI | Busca canal do tronco na `t_monitor_voxcall` (coluna `canal`) + AMI `Redirect` com `Context: MANAGER` |
+| `POST /api/agent/transfer` | Transferência cega | ARI + AMI | `findClientChannelForRamal(ramal)` (ARI: descobre canal real do cliente atravessando bridges + Local pairs) + AMI `Redirect` com `Context: MANAGER` |
+| `POST /api/agent/transfer-satisfacao` | Transferência cega para URA de Pesquisa de Satisfação | ARI + AMI | Mesma lógica de `/transfer`, mas extension=`*100` e NÃO remove linha de `t_monitor_voxcall` (trigger `trg_enriquece_pesquisa_satisfacao` precisa) |
 | `POST /api/agent/consult` | Transferência assistida | AMI | `findChannelByRamal` para achar canal do operador + AMI `Atxfer` com `Context: MANAGER`. Coloca chamada em espera, liga para destino, transfere quando operador desliga |
 | `POST /api/agent/hangup` | Desligar | ARI | `findChannelByRamal` + `DELETE /channels/{channelId}` |
 | `GET /api/agent/calls/attended` | Atendidas hoje | DB | queue_log COMPLETEAGENT/COMPLETECALLER por operador, paginado (page/limit) |
@@ -587,8 +593,22 @@ Protegidos por `requireAgentAuth`. O ramal vem de `req.session.agentSession.rama
 **Audio auth**: `/api/cdr/audio/:uniqueid` aceita tanto sessão de usuário quanto sessão de agente (`req.session.agentSession`).
 
 **Diferença entre Transfer e Consult:**
-- **Transfer (Redirect)**: Transferência cega — redireciona o canal do tronco (da `t_monitor_voxcall`) direto para o destino. O operador sai da chamada imediatamente.
+- **Transfer (Redirect)**: Transferência cega — redireciona o canal **externo do cliente** direto para o destino. O operador sai da chamada imediatamente. **CRÍTICO**: o canal alvo deve ser descoberto via ARI (`findClientChannelForRamal`), NUNCA usar a coluna `canal` da `t_monitor_voxcall` cru — em chamadas do dialer (Originate Local + Queue) ela aponta para `Local/...;1` (lado interno do canal Local que conecta de volta no Manager dialplan), e o `Redirect` nesse lado deixa o cliente órfão e a chamada cai.
 - **Consult (Atxfer)**: Transferência assistida — usa o canal do operador (PJSIP/ramal). O Asterisk coloca a chamada original em espera, liga para o destino, e quando o operador desliga, a chamada original é conectada ao destino.
+
+### Helper `findClientChannelForRamal(ramal)` — Descoberta do canal real do cliente
+
+Definida em `server/routes.ts` (~L2351). Padrão obrigatório para qualquer transferência cega no VoxCALL. Algoritmo:
+
+1. Busca em paralelo `GET /channels` e `GET /bridges` via ARI.
+2. Localiza o canal do operador: `ch.name` casa com `^(PJSIP|SIP|IAX2)/{ramal}-` e `state === 'Up'`.
+3. Procura o bridge que contém o `id` desse canal e pega o **peer** (o outro `channel id` na lista do bridge).
+4. Se o peer for `Local/...;1` ou `Local/...;2`, troca `;1`↔`;2` para achar o "irmão" Local channel, busca o bridge dele, pega o peer desse irmão, e repete (até profundidade 4 — guarda contra loops em dialplans muito complexos).
+5. Retorna o primeiro canal **não-Local** encontrado (o tronco PJSIP/SIP/IAX externo do cliente). Se a cadeia terminar em Local channel, retorna `null` (chamada possivelmente meio-transferida ou mal-formada).
+
+**Por que esse padrão é necessário no dialer**: o `Originate Local/{phone}@MANAGER` + `Application=Queue` cria duas pontes. Bridge A: operador (`PJSIP/100`) ↔ `Local/{phone}@MANAGER-XXX;2` (lado Queue). Bridge B: `Local/{phone}@MANAGER-XXX;1` (lado Manager) ↔ tronco externo do cliente (`PJSIP/trunk-YYY`). Para achar o tronco do cliente partindo do operador, é necessário atravessar do Bridge A para o Bridge B através do par Local.
+
+**Comparação com `consult-cancel`** (`server/routes.ts` ~L8624): aquele endpoint procura especificamente o `Local/...;1` dentro do bridge do operador para fazer Hangup nele (cancelar Atxfer e voltar ao cliente original) — propósito diferente, lógica intencionalmente diferente. Use `findClientChannelForRamal` para `transfer`/`transfer-satisfacao`, e a busca de Local;1 in-bridge para `consult-cancel`.
 
 ### Dialplan Asterisk — Contexto [MANAGER]
 
