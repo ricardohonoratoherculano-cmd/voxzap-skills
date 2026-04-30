@@ -165,6 +165,24 @@ if (/^\d{2}\/\d{2}\/\d{4}/.test(dateStr)) return dateStr;
 
 **Applies to ALL reports**: attended calls, abandoned calls, CDR viewer, queue_log viewer, retorno pendentes, Report Assistant templates, and AI-generated custom queries.
 
+### CRITICAL: Timestamp Formatting in Node.js (when SQL TO_CHAR is not viable)
+
+When you must format a `Date` (or `timestamptz`) on the Node side — for instance because the value comes from a join, a cache, or a non-trivial pipeline — **NEVER** use the `getUTC*` family (`getUTCDate`, `getUTCHours`, …) and **NEVER** call `.toLocaleString()` without an explicit `timeZone`. Both produce a +3h drift versus the platform's official timezone (`America/Sao_Paulo`).
+
+Use the centralized helpers in `server/utils/datetime.ts`:
+```typescript
+import { formatBRDateTime, formatBRDate, formatBRTime, SAO_PAULO_TZ } from "./utils/datetime";
+
+// dd/MM/yyyy HH:mm:ss em America/Sao_Paulo
+hora_login: formatBRDateTime(row.hora_login),  // Date | string | number | null -> string | null
+dia:        formatBRDate(row.eventdate),
+hora:       formatBRTime(row.eventdate),
+```
+
+The helpers wrap `Intl.DateTimeFormat` with `timeZone: 'America/Sao_Paulo'`, so the output is the same horário visto pelo Asterisk, pelo `psql` e pelos relatórios — independentemente do fuso do container Node ou do navegador do usuário.
+
+**Real bug fixed (referência)**: `server/routes.ts` formatava `hora_login` em `/api/callcenter/operators-status` com `getUTCDate/getUTCHours/...`. Como o `pg` driver entrega o timestamp como instante UTC (`08:05` em SP = `11:05Z`), a coluna "HORA LOGIN" da dashboard mostrava 11:05 em vez de 08:05. Substituído por `formatBRDateTime(row.hora_login)`. Aplique o mesmo padrão em qualquer novo endpoint que devolva `Date` para o frontend.
+
 ### Report Filter Convention
 All report pages follow this filter pattern:
 - **Date range:** Two date inputs (`startDate`, `endDate`), **ALWAYS defaulting to current date** (`new Date().toISOString().split('T')[0]`). NEVER use date subtraction (e.g. `-7` days, `-30` days) for defaults.
