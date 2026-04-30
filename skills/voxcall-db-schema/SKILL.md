@@ -99,7 +99,7 @@ O sistema `server/db-bootstrap.ts` executa automaticamente na inicialização do
 | `callback` | Callbacks agendados. PK: id (serial) |
 | `agendamento` | Agendamentos. PK: id (serial) |
 | `scripts_atendimento` | Scripts de atendimento. PK: id (serial). UNIQUE(nome) |
-| `pesquisa_satisfacao` | Pesquisa de satisfação. PK: id (serial) |
+| `pesquisa_satisfacao` | Pesquisa de satisfação. PK: id (serial). Schema legacy do Asterisk: colunas genéricas `vago1..vago4`. **`vago1` = uniqueid da chamada original** (FK lógica para `cdr.uniqueid` e `t_monitor_voxcall.callid`); **`vago2` = sub-nota** (string). NÃO existe coluna `motivo`. Trigger BEFORE/AFTER INSERT `enriquece_pesquisa_satisfacao` faz lookup em `t_monitor_voxcall.callid = NEW.vago1` para popular `fila`/`operador` (que entram vazios pelo módulo C da URA *100@MANAGER). Para puxar duração da chamada no relatório use subquery correlata `(SELECT MAX(billsec)::int FROM cdr WHERE uniqueid = p.vago1)` — o MAX evita duplicação quando o uniqueid tem múltiplas pernas no CDR. |
 | `servidor_manager` | Servidores gerenciados. PK: id (serial) |
 | `webcall` | WebCall click-to-call. PK: id_webcall (serial) |
 | `portabilidade` | Portabilidade numérica |

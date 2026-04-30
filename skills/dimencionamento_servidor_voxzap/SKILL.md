@@ -149,9 +149,87 @@ Sem essas premissas, **degradar 1 tier** na estimativa.
 7. Adicionar **20% de folga** acima do tier resultante (cliente vai crescer).
 8. Validar com cliente: SLA, janela de manutenção aceita, orçamento.
 
+## VoxCALL — adaptação para call center com Asterisk
+
+VoxZap usa 3 containers (app + db + nginx). **VoxCALL adiciona 2 containers** que VoxZap não tem:
+- **asterisk** (PBX, `network_mode: host`, SIP/RTP/AMI/ARI) — CPU-bound em pico de chamadas, RTP é I/O-sensível
+- **asterisk-extdb** (PostgreSQL dedicado de telefonia: `cdr`, `queue_log`, `sip_conf`, `queue_table`, etc.) — escrita constante, queries de relatório pesadas
+
+A regra é: **manter o sizing do app/db igual ao VoxZap do mesmo tier**, e **somar** o orçamento de Asterisk + Postgres-telefonia.
+
+### Distribuição recomendada (VoxCALL multi-tenant em servidor compartilhado)
+
+Tier "Padrão" VoxCALL = mesma capacidade que Padrão VoxZap (35 operadores), porém com Asterisk + extdb por tenant:
+
+| Container | cpus | memory | Observações |
+|-----------|------|--------|-------------|
+| `{tenant}-app` (Node) | 6 | 6g | `NODE_OPTIONS=--max-old-space-size=4096`, `UV_THREADPOOL_SIZE=16` |
+| `{tenant}-asterisk` | 4 | 4g | `network_mode: host`, `oom_score_adj: -500` |
+| `{tenant}-db` (Drizzle/VoxCALL) | 1 | 1g | tabelas internas (users, extensions, dialplans...) |
+| `{tenant}-asterisk-extdb` (PG telefonia) | 4 | 4g | `shm_size: 1gb`, `oom_score_adj: -800` |
+| **Total por tenant** | **~15 vCPU** | **~15 GB** | em servidor 80/64 cabem ~4 tenants Padrão folgados |
+
+### Postgres telefonia — params via `command:` (boot, NÃO online)
+
+⚠️ Os params abaixo são **fixados via flag `-c` no docker-compose** e exigem recriação do container. `ALTER SYSTEM` + `pg_reload_conf()` **não tem efeito** quando o param está na linha de comando do postmaster (`pg_settings.source = 'command line'`).
+
+```yaml
+# /opt/tenants/{tenant}/asterisk-extdb/docker-compose.yml — tier Padrão
+asterisk-extdb:
+  image: postgres:17-alpine
+  command: >
+    -c shared_buffers=1GB              # 25% da memory do container
+    -c effective_cache_size=3GB        # 75% da memory
+    -c work_mem=32MB                   # ordenação por conexão
+    -c maintenance_work_mem=256MB      # VACUUM/CREATE INDEX
+    -c wal_buffers=16MB
+    -c max_parallel_workers_per_gather=2
+    -c random_page_cost=1.1            # SSD
+    -c max_connections=200
+  shm_size: "1gb"
+  mem_limit: 4g
+  cpus: 4.0
+  oom_score_adj: -800
+```
+
+⚠️ **Cuidado com `work_mem × max_connections`**: pior caso teórico = `200 × 32MB = 6.4GB` em sorts/hash simultâneos, o que estoura `mem_limit: 4g` e dispara OOM-kill do extdb. Na prática o Asterisk usa <30 conexões e poucas fazem sort ao mesmo tempo, mas se for ativar relatório BI pesado em horário comercial, **reduzir `work_mem` para 16MB** ou **subir `mem_limit` para 6g**. Monitorar `pg_stat_activity` (`state='active'` + `query LIKE '%ORDER BY%'`) e `dmesg | grep -i 'killed process'` na primeira semana.
+
+### Tabela de tiers VoxCALL (multi-tenant em eveo1 ou single-tenant)
+
+| Tier | Operadores | App (cpu/mem) | Asterisk (cpu/mem) | extdb (cpu/mem/shm/shared_buf) | db (cpu/mem) | Soma limites (cpu/mem) | Host mín. single-tenant | Host com overcommit (multi-tenant) |
+|------|-----------|---------------|--------------------|--------------------------------|--------------|------------------------|-------------------------|------------------------------------|
+| Pequeno | até 10 | 2 / 2g | 2 / 2g | 2 / 2g / 512m / 512MB | 1 / 512m | 7 / 6.5g | **8 vCPU / 8 GB** | 4 vCPU / 6 GB (overcommit ~1.7×) |
+| Médio | até 20 | 4 / 4g | 3 / 3g | 3 / 3g / 1g / 768MB | 1 / 1g | 11 / 11g | **12 vCPU / 12 GB** | 6 vCPU / 10 GB (overcommit ~1.8×) |
+| **Padrão** | **até 35** | **6 / 6g** | **4 / 4g** | **4 / 4g / 1g / 1GB** | **1 / 1g** | **15 / 15g** | **16 vCPU / 16 GB** | **8 vCPU / 14 GB** (overcommit ~1.9×) ✅ medido (PlanoClin slot em eveo1 80/64) |
+| Grande | até 60 | 8 / 10g | 6 / 6g | 6 / 6g / 2g / 2GB | 2 / 2g | 22 / 24g | **24 vCPU / 32 GB** | 12 vCPU / 28 GB (overcommit ~1.8×) |
+| XGrande | até 100 | 12 / 16g | 8 / 8g | 8 / 12g / 4g / 4GB | 4 / 4g | 32 / 40g | **32 vCPU / 48 GB** | 20 vCPU / 44 GB (overcommit ~1.6×) |
+
+> **CPU limits são "burst/teto", não reserva**. Docker `cpus:` é hard cap (cgroup CPU quota). RAM `mem_limit:` é hard cap também (OOM-kill ao estourar). A coluna **Host mín. single-tenant** soma os tetos exatamente — se o cliente realmente saturar todos os containers ao mesmo tempo, é o que precisa do host. A coluna **overcommit (multi-tenant)** assume que app + extdb não picam juntos (na prática Asterisk pica em chamadas, app pica em login/dashboard, extdb pica em relatório — não simultâneos). É o modelo da eveo1 (80/64 com 4-5 tenants Padrão coexistindo). Se o cliente é single-tenant **e** vai rodar relatório BI no horário de pico, **provisionar pelo Host mín. single-tenant**, não pelo overcommit.
+
+> **Caso real medido — PlanoClin (clin.voxcall.cc, slot em eveo1 80/64):** com tier Padrão acima sustenta operação atual sem OOM, RTP estável, queries CDR < 500ms. Antes do tuning estava com app=1g/1.5cpu (130MB usados, mas margem zero pra picos), extdb sem limite (336MB livres + shared_buffers=512MB era apertado para o volume de queue_log).
+
+### Diferenças vs VoxZap a lembrar sempre
+
+- **Asterisk não pode morrer**: `oom_score_adj: -500`, `restart: unless-stopped` obrigatório. Recriação derruba chamadas em curso (~10-20s) — **sempre** confirmar janela de manutenção com o cliente antes de `docker compose up -d` no stack do tenant.
+- **extdb separado**: nunca compartilhar a instância PostgreSQL do app (Drizzle) com a do Asterisk — dois perfis de carga muito diferentes (OLTP enxuto vs escrita massiva de eventos + queries de relatório).
+- **Compose separado para extdb**: `/opt/tenants/{tenant}/asterisk-extdb/docker-compose.yml` é independente do compose principal do tenant. Permite reiniciar só o PG telefonia sem mexer no Asterisk/app.
+- **WSS/ARI**: a porta ARI (`8088 + slot`) serve tanto API REST do ARI quanto WebSocket WebRTC `/ws`. TLS terminado no Nginx-tenants centralizado.
+- **Multiplicador de campanhas em VoxCALL**: discadores ativos consomem CPU do Asterisk linearmente (cada chamada = 1 canal). Aplicar × 0.7 no count de operadores se o tenant tem dialer rodando full-time.
+
+### Procedimento de up-sizing (sem perder dados)
+
+1. Backup `.env` + ambos composes + `pg_dump` do extdb
+2. ALTER SYSTEM dos params USERSET-context (work_mem, etc.) — vale para sessões novas, **não** vale para params fixados em `command:`
+3. Editar `.env` (limites de mem/cpu) e `asterisk-extdb/docker-compose.yml` (`-c` flags + `mem_limit` + `shm_size`)
+4. **Confirmar janela com o cliente** (~30s de impacto)
+5. `docker compose up -d` em `/opt/tenants/{tenant}/asterisk-extdb/` → aguardar `healthy`
+6. `docker compose up -d` em `/opt/tenants/{tenant}/` → aguarda app responder `serving on port 5000`
+7. Validar: `docker stats`, `pg_settings`, heap do Node (`v8.getHeapStatistics().heap_size_limit`), `curl https://dominio/`
+
 ## Referências cruzadas
 
-- `.agents/skills/multi-tenant-server/SKILL.md` — quando consolidar múltiplos clientes em um servidor
+- `.agents/skills/multi-tenant-server/SKILL.md` — quando consolidar múltiplos clientes em um servidor (VoxCALL e VoxZap)
 - `.agents/skills/migracao_zpro_voxzap/SKILL.md` — performance tuning pós-cutover (Fase 5)
-- `.agents/skills/locktec-migration/SKILL.md` — caso real medido (cliente piloto)
+- `.agents/skills/locktec-migration/SKILL.md` — caso real medido VoxZap (cliente piloto Locktec)
 - `.agents/skills/deploy-assistant-vps/SKILL.md` — provisionamento de VPS novo
+- `.agents/skills/voxcall-native-asterisk-deploy/SKILL.md` — deploy VoxCALL com Asterisk nativo (cenário diferente do multi-tenant)

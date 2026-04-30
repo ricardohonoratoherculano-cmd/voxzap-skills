@@ -22,8 +22,6 @@ Skill para operar múltiplos clientes (tenants) em um único servidor dedicado, 
 - Deploy single-tenant (1 cliente = 1 VPS) → use `deploy-assistant-vps`
 - VPS com Asterisk nativo (não Docker) → use `voxcall-native-asterisk-deploy`
 - Configuração interna do Asterisk (dialplan, PJSIP) → use skills de Asterisk
-- **Tenant VoxZap (sem Asterisk, stack Node + Prisma + Postgres)** → use `voxzap-multitenant-install` (specialização desta skill, com SFTP-friendly templates, comando `prisma db push` correto, e bugs históricos do voxzap-locktec/voxzap-voxtel já mapeados). Esta skill aqui assume tenant VoxCALL com Asterisk.
-- **Tenant site institucional estático (PHP + nginx, sem app Node, sem Asterisk, sem DB)** — exemplo: `voxtel.cc` no slot 4 de `eveo1` → use `site-voxtel`. Bundle 65KB, container hardened (`mem 256m / cpus 0.5 / pids 128 / no-new-privileges`), deploy em <30s via `tar + scp + docker compose up -d --build`.
 
 ## Modelo de Isolamento
 
@@ -99,8 +97,6 @@ Cada tenant recebe um **slot numérico** (1, 2, 3...) que define todas as suas p
 | **ARI/WSS HTTP** | 8088 + N | 8089 | 8090 | 8091 | 8098 | 127.0.0.1 |
 | **RTP início** | 10000 + (N×1000) | 11000 | 12000 | 13000 | 20000 | 0.0.0.0 |
 | **RTP fim** | RTP início + 999 | 11999 | 12999 | 13999 | 20999 | 0.0.0.0 |
-| **VoxCall-GW RTP início** | 47000 + ((N-1)×100) | 47000 | 47100 | 47200 | 47900 | 0.0.0.0 |
-| **VoxCall-GW RTP fim** | GW início + 99 | 47099 | 47199 | 47299 | 47999 | 0.0.0.0 |
 
 **ARI e WS compartilham a mesma porta HTTP:** O Asterisk tem um único servidor HTTP interno (`http.conf`, `bindaddr=127.0.0.1`) que serve tanto a API REST do ARI (`/ari/...`) quanto WebSocket SIP para WebRTC (`/ws`). A porta ARI_PORT atende ambos.
 
@@ -204,7 +200,7 @@ services:
     volumes:
       - asterisk_recordings:/var/spool/asterisk/monitor
       - asterisk_configs:/etc/asterisk
-      - ./asterisk:/etc/asterisk/custom:ro
+      - ./asterisk/custom:/etc/asterisk/custom:ro
     environment:
       - ASTERISK_SIP_PORT=${SIP_PORT}
       - ASTERISK_AMI_PORT=${AMI_PORT}
@@ -383,7 +379,7 @@ services:
 
 ```nginx
 # Rate limiting zones (colocar no nginx.conf principal ou em conf.d/00-rate-limit.conf)
-# limit_req_zone $binary_remote_addr zone=api_limit:20m rate=500r/s;
+# limit_req_zone $binary_remote_addr zone=api_limit:10m rate=30r/s;
 # limit_req_zone $binary_remote_addr zone=login_limit:10m rate=5r/m;
 
 # Tenant: acme (slot 1, app porta 5001, ARI/WSS porta 8089)
@@ -413,10 +409,9 @@ server {
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     client_max_body_size 50M;
 
-    # Rate limiting na API (anti-DDoS de borda — limites finos por usuário/tenant
-    # ficam no Express, ver `server/middleware/rate-limit.ts`)
+    # Rate limiting na API
     location /api/ {
-        limit_req zone=api_limit burst=1000 nodelay;
+        limit_req zone=api_limit burst=50 nodelay;
         proxy_pass http://127.0.0.1:5001;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -470,29 +465,11 @@ Criar este arquivo para definir as zonas de rate limiting usadas por todos os te
 
 ```nginx
 # /opt/tenants/nginx/conf.d/00-rate-limit.conf
-# Zonas de rate limiting compartilhadas por todos os tenants.
-# IMPORTANTE: nginx atua APENAS como anti-DDoS de borda (limite por IP).
-# Limites finos por usuário/tenant rodam no Express
-# (server/middleware/rate-limit.ts). Não rebaixar para 30r/s sem motivo:
-# clientes corporativos saem por NAT — todos os operadores vêm do mesmo IP.
-limit_req_zone $binary_remote_addr zone=api_limit:20m rate=500r/s;
+# Zonas de rate limiting compartilhadas por todos os tenants
+limit_req_zone $binary_remote_addr zone=api_limit:10m rate=30r/s;
 limit_req_zone $binary_remote_addr zone=login_limit:10m rate=5r/m;
 limit_req_status 429;
 ```
-
-### Arquitetura de Rate Limit em 3 Camadas (recomendada)
-
-Validada em produção (Locktec, 2026-04). Sem isso, tenants com NAT corporativo bateram massivamente em `429`.
-
-| Camada | Onde | Limite | Por | Objetivo |
-|---|---|---|---|---|
-| 1. Anti-DDoS | nginx `api_limit` | 500 r/s burst 1000 | IP | Bloquear flood/abuso de borda |
-| 2. Por usuário | Express middleware | 60 r/s | `userId` | Conter operador/script com bug |
-| 3. Por tenant | Express middleware | 1000 r/s | `tenantId` | Proteger DB de tenant ruidoso |
-
-- Camadas 2 e 3 ficam no app: `server/middleware/rate-limit.ts` (in-memory `Map`, fail-open). Plugado em `authenticateToken`. Skip em `/api/health`, `/api/login`, `/api/auth`, `/api/webhook`, `/api/socket.io`.
-- 429 retorna sempre com header `Retry-After`. O frontend (`queryClient.ts`) respeita o header e faz retry só em GET/HEAD com jitter.
-- `use-socket.ts` no front coalesce invalidações de query (debounce 200–250 ms) para não pressionar a camada 2 quando há rajada de mensagens via socket.
 
 ### Wildcard SSL (Opcional)
 
@@ -735,7 +712,7 @@ echo "  Portas: APP=$APP_PORT DB=$DB_PORT SIP=$SIP_PORT AMI=$AMI_PORT ARI/WSS=$A
 
 # 1. Criar diretórios
 TENANT_DIR="$TENANTS_DIR/$TENANT_ID"
-mkdir -p "$TENANT_DIR"/{source,config,backups,asterisk}
+mkdir -p "$TENANT_DIR"/{source,config,backups,asterisk/custom}
 
 # 2. Extrair código-fonte
 if [ -f "$BASE_SOURCE" ]; then
@@ -825,6 +802,56 @@ CREATE INDEX IF NOT EXISTS idx_cdr_dst ON cdr(dst);
 CREATE INDEX IF NOT EXISTS idx_queue_log_time ON queue_log("time");
 CREATE INDEX IF NOT EXISTS idx_queue_log_queuename ON queue_log(queuename);
 CREATE INDEX IF NOT EXISTS idx_queue_log_agent ON queue_log(agent);
+
+-- ===== CEL (Channel Event Logging) =====
+-- Pipeline: Asterisk CEL (CHAN_START) -> INSERT em cel (UNLOGGED)
+--   -> trigger trg_cel_captura_canal -> INSERT em canal_chamada (linkedid, canal)
+--   -> monitor_voxcall() lê no CONNECT -> UPDATE t_monitor_voxcall.canal
+-- A tabela cel é UNLOGGED + trigger BEFORE INSERT que retorna NULL,
+-- então nunca cresce em disco. Espelha server/asterisk-schema.sql:984-1070.
+CREATE UNLOGGED TABLE IF NOT EXISTS cel (
+    id numeric, eventtime text, eventtype text, userdeftype text,
+    cid_name text, cid_num text, cid_ani text, cid_rdnis text, cid_dnid text,
+    exten text, context text, channame text, appname text, appdata text,
+    accountcode text, peeraccount text, uniqueid text, linkedid text,
+    amaflags numeric, userfield text, peer text
+);
+
+CREATE TABLE IF NOT EXISTS canal_chamada (
+    linkedid text PRIMARY KEY,
+    canal text NOT NULL,
+    created_at timestamp without time zone DEFAULT now()
+);
+
+CREATE OR REPLACE FUNCTION fn_cel_captura_canal() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.eventtype = 'CHAN_START' THEN
+        INSERT INTO canal_chamada (linkedid, canal)
+        VALUES (NEW.linkedid, NEW.channame)
+        ON CONFLICT (linkedid) DO NOTHING;
+    END IF;
+    RETURN NULL;  -- cancela INSERT na cel (UNLOGGED nunca cresce)
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_cel_captura_canal ON cel;
+CREATE TRIGGER trg_cel_captura_canal
+    BEFORE INSERT ON cel FOR EACH ROW
+    EXECUTE FUNCTION fn_cel_captura_canal();
+
+CREATE OR REPLACE FUNCTION fn_canal_chamada_cleanup() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+BEGIN
+    DELETE FROM canal_chamada WHERE created_at < now() - interval '24 hours';
+    RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_canal_chamada_cleanup ON canal_chamada;
+CREATE TRIGGER trg_canal_chamada_cleanup
+    AFTER INSERT ON canal_chamada FOR EACH STATEMENT
+    EXECUTE FUNCTION fn_canal_chamada_cleanup();
 INITDB
 
 # 6. Criar docker-compose.yml
@@ -858,7 +885,7 @@ services:
     volumes:
       - asterisk_recordings:/var/spool/asterisk/monitor
       - asterisk_configs:/etc/asterisk
-      - ./asterisk:/etc/asterisk/custom:ro
+      - ./asterisk/custom:/etc/asterisk/custom:ro
     environment:
       - ASTERISK_SIP_PORT=${SIP_PORT}
       - ASTERISK_AMI_PORT=${AMI_PORT}
@@ -943,13 +970,89 @@ cat > "$TENANT_DIR/config/db-config.json" <<DBCONF
 }
 DBCONF
 
+# 7b. Criar overrides do Asterisk para o tenant (cel.conf + cel_pgsql.conf)
+# O entrypoint da imagem voxcall-asterisk:latest copia tudo de /etc/asterisk/custom/*.conf
+# por cima de /etc/asterisk/ no boot, então estes arquivos passam a valer para o tenant.
+cat > "$TENANT_DIR/asterisk/custom/cel.conf" <<'CELCONF'
+; CEL (Channel Event Logging) — habilitado para capturar canal externo via trigger PostgreSQL.
+; events=ALL é necessário no Asterisk 22 (CHAN_START isolado causa reload failure).
+; O trigger fn_cel_captura_canal() filtra apenas CHAN_START e retorna NULL para
+; cancelar todos os INSERTs — a tabela cel (UNLOGGED) nunca cresce.
+[general]
+enable=yes
+apps=all
+events=ALL
+dateformat=%F %T
+
+[manager]
+enabled=no
+CELCONF
+
+cat > "$TENANT_DIR/asterisk/custom/cel_pgsql.conf" <<CELPGSQL
+[global]
+hostname=127.0.0.1
+port=$DB_PORT
+dbname=asterisk
+user=voxcall
+password=$DB_PASSWORD
+table=cel
+appname=asterisk_$TENANT_ID
+CELPGSQL
+
+# 7c. Healthcheck pós-provisionamento do CEL (executar manualmente após docker compose up -d)
+cat > "$TENANT_DIR/check-cel.sh" <<'CHECKCEL'
+#!/bin/bash
+# Valida que o pipeline CEL está ativo no tenant.
+# Uso: ./check-cel.sh
+set -e
+TENANT_ID=$(grep '^TENANT_ID=' .env | cut -d= -f2)
+DB_PORT=$(grep '^DB_PORT=' .env | cut -d= -f2)
+
+echo "=== 1a. Asterisk: módulo cel_pgsql.so carregado? ==="
+MOD=$(docker exec ${TENANT_ID}-asterisk asterisk -rx "module show like cel_pgsql" 2>&1 || true)
+echo "$MOD"
+echo "$MOD" | grep -q "cel_pgsql.so" || {
+  echo "FALHA: cel_pgsql.so não está carregado. Corrija com:"
+  echo "  docker exec ${TENANT_ID}-asterisk asterisk -rx 'module load cel_pgsql.so'"
+  echo "  (ou adicione 'load => cel_pgsql.so' em asterisk/custom/modules.conf)"
+  exit 1
+}
+echo "OK: módulo cel_pgsql.so carregado"
+
+echo ""
+echo "=== 1b. Asterisk: cel show status ==="
+STATUS=$(docker exec ${TENANT_ID}-asterisk asterisk -rx "cel show status" 2>&1 || true)
+echo "$STATUS"
+echo "$STATUS" | grep -q "CEL Logging: Enabled" || { echo "FALHA: CEL não está habilitado"; exit 1; }
+echo "$STATUS" | grep -qi "PGSQL" || { echo "FALHA: backend cel_pgsql não carregado"; exit 1; }
+echo "OK: CEL ativo + cel_pgsql backend"
+
+echo ""
+echo "=== 2. DB: smoke test do trigger trg_cel_captura_canal ==="
+docker exec ${TENANT_ID}-db psql -U voxcall -d asterisk -At <<SQL
+INSERT INTO cel (eventtype, channame, linkedid)
+VALUES ('CHAN_START', 'SIP/healthcheck-trunk', 'cel_smoke_$$');
+SELECT 'cel_rows=' || COUNT(*) FROM cel WHERE linkedid='cel_smoke_$$';
+SELECT 'canal_chamada_rows=' || COUNT(*) FROM canal_chamada WHERE linkedid='cel_smoke_$$';
+DELETE FROM canal_chamada WHERE linkedid='cel_smoke_$$';
+SQL
+echo "Esperado: cel_rows=0 (cancelado), canal_chamada_rows=1"
+
+echo ""
+echo "=== 3. Pipeline funcionando? (após chamada real) ==="
+echo "Após uma chamada nova, rodar:"
+echo "  docker exec ${TENANT_ID}-db psql -U voxcall -d asterisk -c \\"
+echo "    \"SELECT COUNT(*) FROM canal_chamada WHERE created_at > now() - interval '5 min';\""
+echo "  Esperado: > 0"
+CHECKCEL
+chmod +x "$TENANT_DIR/check-cel.sh"
+
 # 8. Criar Nginx rate limiting (se não existir) e server block
 mkdir -p "$TENANTS_DIR/nginx/conf.d"
 RATE_LIMIT_CONF="$TENANTS_DIR/nginx/conf.d/00-rate-limit.conf"
 if [ ! -f "$RATE_LIMIT_CONF" ]; then
   cat > "$RATE_LIMIT_CONF" <<'RATELIMIT'
-# Anti-DDoS de borda. Limites finos por usuário/tenant ficam no Express.
-limit_req_zone $binary_remote_addr zone=api_limit:20m rate=500r/s;
+limit_req_zone $binary_remote_addr zone=api_limit:10m rate=30r/s;
 limit_req_zone $binary_remote_addr zone=login_limit:10m rate=5r/m;
 limit_req_status 429;
 RATELIMIT
@@ -986,9 +1089,9 @@ server {
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     client_max_body_size 50M;
 
-    # Rate limiting na API (anti-DDoS de borda; limites por usuário/tenant no Express)
+    # Rate limiting na API
     location /api/ {
-        limit_req zone=api_limit burst=1000 nodelay;
+        limit_req zone=api_limit burst=50 nodelay;
         proxy_pass http://127.0.0.1:$APP_PORT;
         proxy_http_version 1.1;
         proxy_set_header Host \\\$host;
@@ -1071,6 +1174,8 @@ echo "  3. Push do schema Drizzle:"
 echo "     docker exec ${TENANT_ID}-app npx drizzle-kit push --force"
 echo "  4. Reiniciar app (para seed):"
 echo "     docker compose restart app"
+echo "  4b. Validar pipeline CEL (canal externo):"
+echo "     ./check-cel.sh"
 echo "  5. SSL (se ainda não tem wildcard):"
 echo "     certbot certonly --webroot -w /var/lib/letsencrypt -d $DOMAIN --agree-tos --email $ADMIN_EMAIL"
 echo "  6. Reload Nginx:"
@@ -1100,6 +1205,29 @@ echo "  RTP: $RTP_START-$RTP_END/udp"
 ```
 
 **Higiene de credenciais:** O script salva credenciais em arquivo separado (`chmod 600`) em vez de imprimir senhas no stdout. Nunca redirecionar a saída do provisionamento para logs compartilhados. Rotacionar credenciais periodicamente via `docker exec <id>-app` para atualizar senhas no banco.
+
+### 6.1 CEL (Channel Event Logging) — provisionamento automático
+
+O pipeline `Asterisk CEL → cel (UNLOGGED) → trg_cel_captura_canal → canal_chamada → monitor_voxcall()` alimenta `t_monitor_voxcall.canal` (canal SIP do tronco externo). Sem ele o painel em tempo real fica com a coluna **Canal** vazia.
+
+**Tenant Docker novo (caminho automático):** O `provision-tenant.sh` acima já cobre tudo:
+
+| Componente | Arquivo gerado pelo script |
+|---|---|
+| Tabela `cel` UNLOGGED + trigger `trg_cel_captura_canal` | `init-db.sql` (seção `===== CEL =====`) |
+| Tabela `canal_chamada` + cleanup 24h | `init-db.sql` |
+| `cel.conf` (`enable=yes`, `events=ALL`) | `asterisk/custom/cel.conf` |
+| `cel_pgsql.conf` apontando para `127.0.0.1:$DB_PORT/asterisk` | `asterisk/custom/cel_pgsql.conf` |
+| Healthcheck pós-deploy (`cel show status` + smoke-test do trigger) | `check-cel.sh` |
+
+A imagem `voxcall-asterisk:latest` (entrypoint atualizado em abr/2026) faz `cp /etc/asterisk/custom/*.conf /etc/asterisk/` no boot, então não há rebuild de imagem por tenant. Só reiniciar o container do Asterisk após mexer em `asterisk/custom/`:
+
+```bash
+docker compose -f /opt/tenants/<id>/docker-compose.yml restart asterisk
+/opt/tenants/<id>/check-cel.sh
+```
+
+**Tenant legacy (Asterisk 11 em CentOS 7, source build):** A imagem Docker não se aplica — o `cel_pgsql.so` pode não estar compilado. Receita completa de compilação manual está em `.agents/skills/asterisk-callcenter-expert/SKILL.md` seção "Habilitar CEL para captura de canal externo" (compilar `cel_pgsql.so` a partir do source, copiar para `/usr/lib64/asterisk/modules/`, carregar com `module load`). Após habilitar o módulo, aplicar **manualmente** os mesmos arquivos `cel.conf` (com `events=CHAN_START` no Asterisk 11, não `ALL`) e `cel_pgsql.conf` apontando para o extdb do tenant. Validar com `asterisk -rx 'cel show status'` (esperado: `CEL Logging: Enabled` + linha do `cel_pgsql backend`).
 
 ---
 
@@ -1570,81 +1698,11 @@ open_tenant_ports acme 5070 11000 11999
 open_tenant_ports globex 5080 12000 12999
 ```
 
-### Docker networking para apps com WhatsApp Calling (VoxCall-GW)
+### Docker network_mode para apps com chamadas WhatsApp
 
-O gateway de WhatsApp Calling abre um socket UDP por chamada para fazer relay de RTP entre Meta (opus@48kHz via WebRTC) e o Asterisk (alaw@8kHz). **Esse socket precisa ser alcançável pelo Asterisk no IP público do host.** Em bridge network, sem mapeamento explícito, os pacotes RTP do Asterisk morrem na borda Docker e a chamada conecta mas fica muda (`astSilenceMs` cresce 5s/10s/15s e o Meta encerra).
+**Apps que usam VoxCall-GW (WhatsApp Calling via ExternalMedia/ARI) DEVEM rodar com `network_mode: host`.** Com bridge networking, o Asterisk envia RTP para o IP do host mas os pacotes não chegam ao container Docker (sem port mapping para portas UDP dinâmicas). Com `network_mode: host`, o app recebe RTP diretamente.
 
-Há **duas estratégias suportadas** — escolha conforme o tipo do servidor:
-
-#### Estratégia A — `network_mode: host` (single-tenant)
-
-Para servidores dedicados a **um único cliente**, o app pode rodar em `network_mode: host` e o socket UDP fica direto no host, sem precisar mapear nada.
-
-```yaml
-app:
-  network_mode: host
-  # remover blocos `ports:` e `networks:` quando usar host
-```
-
-❌ **Não use em servidores multi-tenant** — colide com outros apps que escutam em `:5000`.
-
-#### Estratégia B — Faixa fixa de portas UDP + bridge (multi-tenant) ✅ recomendada
-
-Para o servidor multi-tenant, cada tenant recebe uma **faixa exclusiva de ~100 portas UDP** que o gateway usa pra abrir os sockets de RTP. A faixa é mapeada explicitamente no `docker-compose` e liberada no firewall.
-
-**1. Alocação de faixa (slot do tenant):**
-
-| Tenant slot | Faixa RTP do gateway |
-|-------------|---------------------|
-| 1 | 47000-47099 |
-| 2 | 47100-47199 |
-| 3 | 47200-47299 |
-| N | `47000 + (N-1)*100` até `47099 + (N-1)*100` |
-
-> Faixa de 100 portas/tenant = ~50 chamadas WhatsApp simultâneas (cada chamada usa 2 portas: send+recv). Aumente se necessário.
-
-**2. `docker-compose.yml` do tenant — bloco `app`:**
-
-```yaml
-app:
-  ports:
-    - "127.0.0.1:${APP_PORT}:5000"
-    - "47000-47099:47000-47099/udp"   # faixa exclusiva deste tenant
-  environment:
-    - TZ=America/Sao_Paulo
-    - VOXCALL_RTP_PORT_MIN=47000
-    - VOXCALL_RTP_PORT_MAX=47099
-  networks:
-    - tenant-net
-```
-
-**3. Firewall (UFW):**
-
-```bash
-ufw allow 47000:47099/udp comment "VoxCall RTP - <tenant>"
-```
-
-**4. Setting `calling_voxcall_rtp_bind`:** deve conter o **IP público do host** (não `0.0.0.0`, não interno Docker). É o IP que vai pro SDP que o gateway envia ao Asterisk.
-
-**Como o gateway usa as env vars:** quando `VOXCALL_RTP_PORT_MIN/MAX` estão setados, a função `getAvailablePort()` sorteia portas dentro da faixa e testa via `bind(port, "0.0.0.0")` até achar uma livre. Sem essas env vars, cai no comportamento padrão (porta efêmera aleatória — só funciona em `network_mode: host`).
-
-#### Validação rápida pós-deploy
-
-```bash
-# Portas devem aparecer expostas no host
-docker ps --filter name=<tenant>-app --format '{{.Ports}}' | grep 47000-47099
-
-# Em uma chamada de teste, o log deve mostrar:
-docker logs --since 2m <tenant>-app | grep "Picked UDP port"
-# [VoxCall-GW] Picked UDP port 47042 from range 47000-47099
-
-# E astSilenceMs deve ficar < 100ms (não crescer 5s/10s/15s)
-docker logs --since 2m <tenant>-app | grep "DIAG.*astSilenceMs"
-```
-
-#### ARI/WS no firewall
-
-O Asterisk HTTP (ARI + WS) é vinculado a `127.0.0.1`. Clientes WebRTC acessam via Nginx HTTPS na porta 443 (`wss://dominio.com/ws` → Nginx termina TLS → proxy para `http://127.0.0.1:ARI_PORT/ws`). Não abrir ARI no firewall.
+**ARI/WS não precisa de porta no firewall:** O Asterisk HTTP (ARI + WS) é vinculado a `127.0.0.1`. Clientes WebRTC acessam via Nginx HTTPS na porta 443 (`wss://dominio.com/ws` → Nginx termina TLS → proxy para `http://127.0.0.1:ARI_PORT/ws`).
 
 **Portas que NÃO devem ser abertas externamente:**
 - APP_PORT (5001, 5002...) — acessado apenas pelo Nginx local
@@ -1694,6 +1752,7 @@ O Asterisk HTTP (ARI + WS) é vinculado a `127.0.0.1`. Clientes WebRTC acessam v
 6. [ ] Build: `cd /opt/tenants/<id> && docker compose up -d --build`
 7. [ ] Push schema: `docker exec <id>-app npx drizzle-kit push --force`
 8. [ ] Restart app: `docker compose restart app`
+8b. [ ] Validar CEL: `cd /opt/tenants/<id> && ./check-cel.sh` (deve passar items 1 e 2)
 9. [ ] SSL: `certbot certonly --webroot -w /var/lib/letsencrypt -d <dominio>`
 10. [ ] Reload Nginx: `docker exec mt-nginx nginx -t && docker exec mt-nginx nginx -s reload`
 11. [ ] Abrir portas no firewall: SIP + RTP do tenant
@@ -1728,28 +1787,39 @@ docker compose ps
 - Verificar config: `docker exec mt-nginx nginx -t`
 
 ### Conflito de portas RTP
-- Nunca alocar faixas RTP sobrepostas (Asterisk: 11000+, Gateway WhatsApp: 47000+)
-- Verificar Asterisk: `ss -ulnp | grep -E '1[0-9]{4}'`
-- Verificar Gateway WhatsApp: `ss -ulnp | grep -E '47[0-9]{3}'`
-- Cada tenant deve ter exatamente 1000 portas RTP do Asterisk + ~100 do gateway WhatsApp
-
-### WhatsApp Calling: chamada conecta mas sem áudio
-Sintoma: ligação atende, ICE/DTLS `connected`, mas `astSilenceMs` cresce 5s → 10s → 15s e o Meta encerra em ~20s.
-
-Causa mais comum: container do app em bridge network sem a faixa UDP do gateway exposta.
-
-Diagnóstico:
-```bash
-docker inspect <tenant>-app --format '{{.HostConfig.NetworkMode}}'
-docker logs --since 5m <tenant>-app | grep "DIAG.*astSilenceMs"
-```
-
-Correção: ver seção **11.3 Estratégia B** (faixa UDP `VOXCALL_RTP_PORT_MIN/MAX` + ports + UFW).
+- Nunca alocar faixas RTP sobrepostas
+- Verificar: `ss -ulnp | grep -E '1[0-9]{4}'`
+- Cada tenant deve ter exatamente 1000 portas RTP exclusivas
 
 ### Memória insuficiente
 - Monitorar: `./monitor-all.sh`
 - Ajustar limites no `.env` do tenant
 - Considerar migrar tenants para outro servidor
+
+### Tenant aponta para Asterisk legacy do cliente (chan_sip)
+Alguns tenants apontam o VoxCALL para o Asterisk **legado do próprio cliente** (que só tem `chan_sip` carregado), em vez do `<id>-asterisk` provisionado. Sintoma: membros de fila aparecem como `(Invalid)` e Originate falha.
+
+**Fix:** Configurar o toggle PJSIP/SIP por tenant via UI ou arquivo:
+```bash
+# Forçar SIP no tenant
+docker exec <id>-app sh -c 'echo "{\"channelTech\":\"SIP\"}" > /app/config/asterisk-config.json'
+docker restart <id>-app
+
+# Validar membros da fila no DB do Asterisk legacy
+psql -h <asterisk_db_host> -p <port> -U asterisk -d asterisk \
+  -c "SELECT membername, interface FROM queue_member_table;"
+# Esperado: interface = SIP/<ramal>
+```
+
+Cada tenant tem seu próprio `/app/config/asterisk-config.json` (default `PJSIP`). Veja `.agents/skills/voxcall-native-asterisk-deploy/SKILL.md` seção "Toggle SIP/PJSIP" para detalhes do helper.
+
+### Build (vite/esbuild) dentro do container exige `-w /app`
+`docker exec <id>-app sh -c 'cd /app && npx vite build'` resolve o `outDir` errado e os assets gerados não chegam a `/app/dist/public/`. Sempre use:
+```bash
+docker exec -w /app <id>-app sh -c 'NODE_OPTIONS=--max-old-space-size=2048 npx vite build'
+docker exec -w /app <id>-app sh -c 'NODE_OPTIONS=--max-old-space-size=2048 npx esbuild server/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist'
+```
+Após qualquer mudança de UI, conferir com `grep -c <novo-testid> /app/dist/public/assets/index-*.js` antes de pedir ao usuário um hard refresh.
 
 ---
 

@@ -119,6 +119,25 @@ Estado **em tempo real** de cada operador — um registro por operador, atualiza
   - **DELETE** (deslogar): `DELETE FROM queue_member_table WHERE membername = operador` (remove de todas as filas)
 - Isso garante que o Asterisk respeita a pausa/logoff — sem esta trigger, o operador continuaria recebendo chamadas mesmo pausado
 
+### ⚠️ Pré-requisito: Backend Realtime do Asterisk DEVE ser pgsql (não ODBC) para PG 14+
+
+Antes de qualquer análise de `queue_log`, confirmar que o Asterisk grava os eventos com **`data1`/`data2`/`data3` populados separadamente**, não tudo concatenado na coluna legada `data`.
+
+**Diagnóstico rápido** — se a query abaixo retornar `data1/data2/data3` vazios para CONNECT/COMPLETE e a coluna `data` com algo tipo `"215|1776524400.135|7"`, o backend está errado:
+```sql
+SELECT event, data, data1, data2, data3 FROM queue_log
+WHERE event IN ('ENTERQUEUE','CONNECT','COMPLETECALLER')
+ORDER BY id DESC LIMIT 10;
+```
+
+**Sintoma típico**: ENTERQUEUE não aparece nunca, dashboard zerado, e `relatorio_operador` poluído com "operadores fantasma" no formato `ramal|uniqueid|posição` (porque a trigger lê o campo `data` concatenado como nome de operador).
+
+**Causa**: `extconfig.conf` do Asterisk com `queue_log => odbc,...` falando com PostgreSQL 14+ — o `psqlodbcw.so` legado cai em path de compatibilidade que serializa as colunas dinâmicas no campo `data` e descarta o ENTERQUEUE silenciosamente.
+
+**Fix**: trocar para o driver nativo `queue_log => pgsql,asterisk,queue_log` em `/etc/asterisk/extconfig.conf` (detalhes completos na skill `voxcall-native-asterisk-deploy`).
+
+**Importante**: Isso afeta APENAS o backend Realtime do `queue_log`. O CDR (`cdr_pgsql.conf`) usa libpq direto e funciona normalmente com qualquer versão de PG.
+
 **Triggers na `queue_log` para normalização e relatórios:**
 - **`trg_normaliza_transferencia`** (BEFORE INSERT) → `fn_normaliza_transferencia()`:
   - Quando `event IN ('ATTENDEDTRANSFER', 'BLINDTRANSFER')`: seta `data5 = 'TRANSFERENCIA'`
@@ -712,6 +731,52 @@ O dashboard (`/api/callcenter/dashboard`) inclui métricas de retorno em duas ca
 
 **Filtro de fila**: Quando `queueFilter` é aplicado, filtra `retorno_historico` por `fila_origem = queueFilter`
 
+### Backfill de `retorno_historico` (Clientes Legados com Discador PHP Externo)
+
+Para clientes que ainda não migraram para o painel do Operador do VoxCALL e usam um script PHP externo para disparar as chamadas de retorno, a `retorno_historico` fica vazia (porque o INSERT acontece no endpoint `/api/agent/retorno-discar`, que esses clientes não chamam). Como consequência, todos os relatórios de retorno (`/calls-by-hour`, dashboard, etc.) mostram zero na coluna **Retornadas**, mesmo com retornos efetivamente acontecendo.
+
+**Solução:** função SQL `public.fn_backfill_retorno_historico(p_days_back integer DEFAULT 7)` instalada via `scripts/backfill/install-backfill-retorno-historico.sql`. A função reconstrói os registros faltantes correlacionando, **direto no `queue_log` (fonte imutável)**, `ABANDON` (em qualquer fila que NÃO comece com `RetornoClientes`) ↔ `ENTERQUEUE` em fila `RetornoClientes%` (mesmo telefone, posterior) ↔ `queue_log.CONNECT` (operador real) ↔ `cdr` (duração). Idempotente: NOT EXISTS por `callid_original` E por `callid_retorno`.
+
+**Por que `queue_log` e não `retorno_clientes`?** A tabela `retorno_clientes` é populada por triggers que fazem `UPDATE` da coluna `event` quando o telefone é retornado/atendido — então o `ABANDON` original **é sobrescrito** para `CONNECT`/`RETORNADO`, perdendo o estado histórico. `queue_log` é append-only, cada evento é uma linha nova, nunca alterada. Além disso, `retorno_clientes.queuename` é hardcoded para `'RetornoClientes'` por trigger (a fila real fica em `retorno_clientes.queue`), o que torna fácil errar o filtro.
+
+**Nota sobre `data2` no Asterisk:** No evento `ENTERQUEUE`, `data2` é o telefone do cliente. No evento `ABANDON`, `data2` é a posição na fila (NÃO o telefone). Para descobrir o telefone do abandono, a função faz JOIN no mesmo `callid` com o `ENTERQUEUE` correspondente.
+
+**Filas de retorno:** a função reconhece QUALQUER queuename que comece com `RetornoClientes` (ex.: `RetornoClientes`, `RetornoClientesSUL`, `RetornoClientesXYZ`). Se o cliente usar nome diferente, ajustar o `LIKE` no corpo da função.
+
+**Instalação no servidor do cliente:**
+```bash
+psql -U asterisk -d asterisk -h <host> -p 5432 \
+     -f install-backfill-retorno-historico.sql
+```
+
+**Backfill inicial (manual, uma vez):**
+```bash
+psql -U asterisk -d asterisk -t -c \
+     "SELECT public.fn_backfill_retorno_historico(90);"
+```
+
+**Agendamento no cron (rodar de hora em hora, janela de 7 dias):**
+```cron
+30 * * * * root psql -U asterisk -d asterisk -p 5432 -t -c \
+  "SELECT public.fn_backfill_retorno_historico(7);" \
+  >> /var/log/voxcall/backfill_retorno.log 2>&1
+```
+
+**Reprocessar um período:**
+```sql
+DELETE FROM retorno_historico
+ WHERE data_retorno::date BETWEEN '2026-04-01' AND '2026-04-30';
+SELECT public.fn_backfill_retorno_historico(60);
+```
+
+**Características importantes:**
+- Registros gerados pelo backfill ficam com `operador='PHP_RETORNO'` quando não há `agent` no `queue_log.CONNECT` (caso típico: cliente não atendeu, então não houve agente). Quando há atendimento, o operador real (`Ruth.lira`, `Marina.gomes` etc.) é capturado.
+- **Pareamento:** para cada chamada de retorno (ENTERQUEUE em fila `RetornoClientes%`), busca o ABANDON imediatamente anterior do mesmo telefone (sem restrição de mesmo dia — abandono pode ser de até 30 dias antes). Usa `DISTINCT ON (callid_retorno)` + `ORDER BY data_abandono DESC` pra garantir que cada retorno consome apenas 1 abandono.
+- **Idempotência DUPLA:** filtra por `NOT EXISTS callid_original` (não reusa abandono) E por `NOT EXISTS callid_retorno` (não duplica linha do mesmo retorno). Ambos os índices são criados pela função.
+- **Status:** determinado pelo evento final do `callid_retorno` em `queue_log` + `cdr.billsec`. COMPLETEAGENT/COMPLETECALLER + billsec>0 → ATENDIDO; CONNECT puro → ATENDIDO; ABANDON/RINGNOANSWER → NAO_ATENDIDO.
+- **Caso real (Voxmax/Boghos, abr/2026):** instalação rodada pela 1ª vez via `SELECT fn_backfill_retorno_historico(90)` populou 2069 retornos cobrindo 88 dias (1140 atendidos / 922 com operador real / 245 fallback PHP_RETORNO atendidos / 912 não atendidos). Re-execuções subsequentes inseriram 0 (idempotência confirmada).
+- Não substitui a Trigger CEL nem o fluxo do painel do VoxCALL — é uma camada complementar para tenants em transição.
+
 ### Filas de Origem — Seletor
 
 A configuração de `filas_origem` usa um seletor de checkboxes inline (não popover):
@@ -792,14 +857,220 @@ O discador preditivo está **implementado e funcional**. Arquivo principal: `ser
 - VPS trigger `fn_atualiza_relatorio_operador`: faltava UNIQUE index em `relatorio_operador(data, operador, fila)` — causava ROLLBACK de toda a cascade de triggers, impedindo gravação do CONNECT
 - Relatório de Operadores: removida captura AMI (operatorRamal/operatorName do InFlightCall), substituída por trigger PostgreSQL `trg_dialer_agent_performance` para dados consistentes
 
-**CEL / canal_chamada (pendente)**:
-- A tabela `cel` existe como UNLOGGED no VPS, com trigger `fn_cel_captura_canal` que captura CHAN_START → `canal_chamada`
-- CEL está **desativado** no Asterisk (`cel.conf` com `enable=yes` comentado)
-- Backend ODBC do CEL (`cel_odbc.conf`) sem configuração ativa
-- O módulo `cel_odbc.so` está carregado no Asterisk mas o CEL core precisa de restart completo para ativar
-- ODBC DSN `asterisk-connector` funciona (localhost:25432, mesmo do CDR)
-- Para ativar: configurar `cel.conf` (enable=yes, events=CHAN_START) e `cel_odbc.conf` (connection=asterisk, table=cel), depois restart do Asterisk
-- O campo `canal` em `t_monitor_voxcall` fica vazio até o CEL ser ativado
+### Habilitar CEL para captura de canal externo
+
+O campo `t_monitor_voxcall.canal` (canal SIP do tronco externo, ex: `SIP/187.72.45.132-000018ef`) só é preenchido quando o pipeline CEL está ativo:
+
+```
+Asterisk CEL (CHAN_START) → INSERT em cel (UNLOGGED) → trigger trg_cel_captura_canal
+   → INSERT em canal_chamada (linkedid, canal) → trigger monitor_voxcall() lê no CONNECT
+   → UPDATE t_monitor_voxcall.canal
+```
+
+**Pré-requisitos no PostgreSQL do extdb (já no schema bootstrap):**
+- Tabela `cel` deve ser **UNLOGGED** (não PERMANENT). Validar:
+  ```sql
+  SELECT relpersistence FROM pg_class WHERE relname='cel';  -- deve ser 'u'
+  ```
+  Se estiver `'p'`, fazer `DROP TABLE cel CASCADE` e recriar conforme `server/asterisk-schema.sql:984-1006`, depois reaplicar `trg_cel_captura_canal`.
+- Trigger `trg_cel_captura_canal` (BEFORE INSERT) + função `fn_cel_captura_canal()` que retorna NULL.
+- Tabela `canal_chamada(linkedid PK, canal, created_at)` + trigger de cleanup `trg_canal_chamada_cleanup` (24h).
+
+**Smoke test do pipeline DB:**
+```sql
+INSERT INTO cel (eventtype, channame, linkedid)
+VALUES ('CHAN_START', 'SIP/test-trunk-99999', 'smoke_test_001');
+SELECT 'cel' AS tbl, COUNT(*) FROM cel WHERE linkedid='smoke_test_001'      -- esperado 0 (cancelado)
+UNION ALL SELECT 'canal_chamada', COUNT(*) FROM canal_chamada WHERE linkedid='smoke_test_001';  -- esperado 1
+DELETE FROM canal_chamada WHERE linkedid='smoke_test_001';
+```
+
+**Configuração no Asterisk:**
+
+> **IMPORTANTE — Asterisk 11 antigo (CentOS 7, instalações via SVN/source pré-2022):** o `cel_pgsql.so` pode não estar compilado mesmo que o source exista. Verificar com `ls /usr/lib*/asterisk/modules/ | grep cel_`. Se ausente, compilar manualmente:
+> ```bash
+> # Pré-req: yum install postgresql-devel  (já costuma estar instalado se cdr_pgsql funciona)
+> cd /usr/src/asterisk-<versão>
+> cp menuselect.makeopts menuselect.makeopts.bak
+> sed -i 's/\bcel_pgsql\b//' menuselect.makeopts   # remove da lista de excluídos
+> make cel                                          # compila apenas os módulos cel/
+> cp cel/cel_pgsql.so /usr/lib64/asterisk/modules/  # ou /usr/lib/asterisk/modules/
+> cp menuselect.makeopts.bak menuselect.makeopts    # restaura
+> asterisk -rx 'module load cel_pgsql.so'
+> asterisk -rx 'core reload'                        # relê cel.conf
+> asterisk -rx 'cel show status'                    # deve mostrar "Enabled" + "CEL PGSQL backend"
+> ```
+> Caso não tenha source, alternativas: instalar pacote (`yum search asterisk-cel`) ou usar `cel_manager.so` (eventos AMI, requer listener custom).
+
+### Receita: Upgrade Asterisk 11 → 20 LTS em paralelo (CentOS 7, sem atualizar SO)
+
+Validado em produção em `planoclin.voxserver.app.br` (2026-04-18). Permite habilitar ARI sem atualizar o sistema operacional, preservando configs chan_sip/chan_dahdi e instalando A20 em `/opt/asterisk-20` ao lado do A11 em `/usr`.
+
+**Pré-requisitos**:
+- EPEL habilitado (`yum repolist | grep epel`)
+- `yum install openssl11 openssl11-devel openssl11-libs gcc-c++ libxml2-devel libxslt-devel libuuid-devel jansson-devel sqlite-devel postgresql-devel`
+
+> **Escopo dos patches abaixo**: validados em `asterisk-20.19.0` + pjproject bundled, compilando com GCC 4.8.5 / glibc 2.17 do CentOS 7. Em outras versões de Asterisk 20.x ou em distros mais novas, verificar antes de aplicar — provavelmente desnecessários.
+
+**Patches obrigatórios em pjproject bundled (CentOS 7 GCC 4.8)**:
+
+1. **EMULATE_ATOMICS para GCC < 4.9** (`third-party/pjproject/source/pjlib/src/pj/os_core_unix.c`): GCC 4.8 não tem `<stdatomic.h>`. Modificar o `#if HAS_STD_ATOMICS` para forçar fallback:
+```c
+#  if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L \
+                                && !defined(__STDC_NO_ATOMICS__) \
+                                && !(defined(__GNUC__) && !defined(__clang__) && (__GNUC__ * 100 + __GNUC_MINOR__) < 409)
+#    define HAS_STD_ATOMICS 1
+#    include <stdatomic.h>
+#  else
+#    define EMULATE_ATOMICS 1
+#  endif
+```
+
+2. **build.mak APP_LDXXFLAGS bug** (`third-party/pjproject/build.mak` linha ~138, gerado pelo aconfigure): remover o `\` do fim de `        $(PJ_VIDEO_LDFLAGS) \` (a continuação cola `export APP_LDXXFLAGS := $(APP_LDFLAGS)` no valor de APP_LDFLAGS, causando erro `gcc: error: export: No such file or directory` ao linkar `libasteriskpj.so`).
+
+**OpenSSL 1.1 prefix isolado** (Asterisk 20 + pjproject precisam TLS_method/BIO_meth_new):
+```bash
+mkdir -p /opt/ssl11-prefix/{include,lib}
+ln -sf /usr/include/openssl11/openssl /opt/ssl11-prefix/include/openssl
+ln -sf /usr/lib64/libssl.so.1.1     /opt/ssl11-prefix/lib/libssl.so
+ln -sf /usr/lib64/libcrypto.so.1.1  /opt/ssl11-prefix/lib/libcrypto.so
+# Configure: --with-ssl=/opt/ssl11-prefix --with-crypto=/opt/ssl11-prefix
+```
+
+**Configure recomendado**:
+```bash
+./configure \
+  --prefix=/opt/asterisk-20 \
+  --sysconfdir=/opt/asterisk-20/etc \
+  --localstatedir=/opt/asterisk-20/var \
+  --with-pjproject-bundled --with-jansson-bundled \
+  --with-ssl=/opt/ssl11-prefix --with-crypto=/opt/ssl11-prefix \
+  --without-asound --without-radius --without-h323 --without-misdn \
+  --without-osptk --without-vorbis --without-x11 --without-bluetooth
+```
+
+**Disables obrigatórios via menuselect** (incompatibilidades conhecidas):
+- `res_cdrel_custom` — módulo custom Voxtel usa `SQLITE_PREPARE_PERSISTENT` (SQLite 3.20+, indisponível no CentOS 7 que tem 3.7)
+- `BUILD_NATIVE` (portabilidade entre VPS)
+- Opcionais: `chan_skinny`, `chan_mgcp`, `chan_unistim`, `chan_alsa`, `chan_console`, `cdr_radius`, `cel_radius`, `cdr_odbc`, `cdr_adaptive_odbc`, `res_snmp`, `app_alarmreceiver`
+
+**Sharing entre versões via symlinks** (preservar /var/spool/asterisk de 275GB de recordings, astdb, sounds, keys):
+```bash
+mv /opt/asterisk-20/var/lib/asterisk    /opt/asterisk-20/var/lib/asterisk.dist
+mv /opt/asterisk-20/var/spool/asterisk  /opt/asterisk-20/var/spool/asterisk.dist
+ln -sfn /var/lib/asterisk    /opt/asterisk-20/var/lib/asterisk
+ln -sfn /var/spool/asterisk  /opt/asterisk-20/var/spool/asterisk
+ln -sfn /var/log/asterisk    /opt/asterisk-20/var/log/asterisk
+# CRÍTICO: copiar documentation/, rest-api/, firmware/, static-http/ do .dist para /var/lib/asterisk
+# (senão Stasis falha com "Cannot update type 'declined_message_types' ... no existing documentation")
+cp -a /opt/asterisk-20/var/lib/asterisk.dist/documentation/* /var/lib/asterisk/documentation/
+cp -a /opt/asterisk-20/var/lib/asterisk.dist/rest-api        /var/lib/asterisk/
+cp -a /opt/asterisk-20/var/lib/asterisk.dist/firmware        /var/lib/asterisk/ 2>/dev/null || true
+cp -a /opt/asterisk-20/var/lib/asterisk.dist/static-http     /var/lib/asterisk/ 2>/dev/null || true
+```
+
+**Configs A11 que quebram em A20**:
+- `cel.conf`: renomear eventos `BRIDGE_START → BRIDGE_ENTER`, `BRIDGE_END → BRIDGE_EXIT`
+- `features.conf`: comentar `parkedplay`, `parkext`, `parkpos`, `context` da seção `[general]` (movidos para res_parking moderno)
+- Criar arquivos vazios (`; placeholder`) para `geolocation.conf`, `pjproject.conf`, `pjsip.conf`, `pjsip_wizard.conf`, `statsd.conf` se não usados (silencia erros benignos)
+
+**asterisk.conf [directories] para coexistência**:
+```ini
+[directories](!)
+astetcdir => /opt/asterisk-20/etc/asterisk
+astmoddir => /opt/asterisk-20/lib/asterisk/modules
+astvarlibdir => /var/lib/asterisk    ; SHARED
+astdbdir => /var/lib/asterisk        ; SHARED (apenas 1 Asterisk pode rodar por vez)
+astdatadir => /var/lib/asterisk      ; SHARED
+astspooldir => /var/spool/asterisk   ; SHARED
+astrundir => /var/run/asterisk
+astlogdir => /var/log/asterisk
+astsbindir => /opt/asterisk-20/sbin
+```
+
+**systemd unit `/etc/systemd/system/asterisk20.service`**:
+```ini
+[Unit]
+Description=Asterisk 20 PBX
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+Environment="LD_LIBRARY_PATH=/opt/asterisk-20/lib:/usr/lib64"
+ExecStart=/opt/asterisk-20/sbin/asterisk -f -vvvg -c -C /opt/asterisk-20/etc/asterisk/asterisk.conf
+ExecStop=/opt/asterisk-20/sbin/asterisk -rx "core stop now"
+Restart=on-failure
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**CLI access para A20** (sempre exporta LD_LIBRARY_PATH):
+```bash
+LD_LIBRARY_PATH=/opt/asterisk-20/lib:/usr/lib64 /opt/asterisk-20/sbin/asterisk -rvvv
+```
+
+**Cutover atômico ~15s**:
+```bash
+asterisk -rx "core stop now"; sleep 3; pkill -9 safe_asterisk
+systemctl start asterisk20
+# Validar: ss -tlnp | grep :5060, sip show peers, curl ARI :8088, cel pgsql
+```
+
+**Rollback em <30s** (em caso de problema imediato no A20):
+```bash
+systemctl stop asterisk20
+pkill -9 -f "/opt/asterisk-20/sbin/asterisk" 2>/dev/null
+/usr/sbin/safe_asterisk &       # reinicia A11 legado
+sleep 5
+/usr/sbin/asterisk -rx "core show version"
+ss -tlnp | grep -E ":(5060|5038|8088) "
+```
+
+`/etc/asterisk/cel.conf`:
+```ini
+[general]
+enable=yes
+apps=all
+events=CHAN_START
+
+[manager]
+enabled=yes
+```
+
+`/etc/asterisk/cel_pgsql.conf` (preferir `cel_pgsql` por ser conexão direta, sem ODBC):
+```ini
+[global]
+hostname=<host_do_extdb>
+port=<porta_do_extdb>
+dbname=asterisk
+user=asterisk
+password=<senha>
+table=cel
+```
+
+Alternativa via ODBC (`cel_odbc.conf` + DSN `asterisk-connector` em `res_odbc.conf`):
+```ini
+[asterisk]
+connection=asterisk
+table=cel
+usegmtime=no
+allowleapsecond=no
+```
+
+**Reload e validação:**
+```bash
+asterisk -rx "module reload cel.so"
+asterisk -rx "module reload cel_pgsql.so"   # ou cel_odbc.so
+asterisk -rx "cel show status"
+
+# Após uma chamada nova:
+psql -c "SELECT COUNT(*) FROM canal_chamada WHERE created_at > now() - interval '5 min';"
+# Esperado: > 0
+```
+
+**Lookup de protocolo (corrigido 2026-04-18)**: A tabela `protocolo` pode ter 2 rows com o mesmo `callid` (placeholder vazio + valor real `DDMMYYYYHHMMSS`). A função `monitor_voxcall()` precisa filtrar `protocolo IS NOT NULL AND protocolo <> ''` com `ORDER BY protocolo DESC LIMIT 1`. Ver `server/asterisk-schema.sql:407-413`.
 
 ### Dados Disponíveis na `retorno_historico`
 
@@ -811,6 +1082,33 @@ A tabela `retorno_historico` contém dados históricos úteis para analytics do 
 - Taxa de sucesso por tentativa: `SELECT tentativa, COUNT(*) FILTER (WHERE status='ATENDIDO') * 100.0 / COUNT(*) FROM retorno_historico GROUP BY tentativa`
 
 **AMI Originate**: Funcional — usa `Context: MANAGER` com canal `Local/PHONE@MANAGER`
+
+## Problema Conhecido: Chamadas Cobranca via Local Channel (IZYDIAL) — sem CONNECT no queue_log
+
+**Cliente:** PlanoClin (clin.voxcall.cc) — discador externo IZYDIAL faz AMI Originate com `Channel: Local/<numero>@IZYDIAL` + `Application: Queue` + `Data: Cobranca,...`.
+
+**Sintoma:** Chamadas da fila **Cobranca** não aparecem no Dashboard "Em Atendimento" e nos relatórios ficam sem ramal/operador. Outras filas (Beneficiario, InsideSales, Dentista — que usam canal SIP direto) funcionam normalmente.
+
+**Causa raiz comprovada empiricamente (teste ao vivo em 2026-04-22):**
+- Asterisk grava o `ENTERQUEUE` no `queue_log` corretamente
+- **NÃO grava `CONNECT`** quando o agente atende (mesmo com atendimento confirmado)
+- Em muitos casos **nem `COMPLETECALLER`/`COMPLETEAGENT`** são gravados
+- `CDR` também fica sem linha para o `uniqueid` original
+- O `t_monitor_voxcall` é alimentado pelo CONNECT do `queue_log` — sem CONNECT, a linha existe (vinda do ENTERQUEUE) mas com `operador`, `ramal`, `canal`, `hora_atendimento` **VAZIOS**
+
+**Por que acontece:** o canal `Local/<num>@IZYDIAL` sofre **optimization/masquerade** do Asterisk. Após o agente atender, os legs Local;1/Local;2 são fundidos com os canais reais (SIP de operador + canal de saída) e o leg que tinha vínculo com o queue logger é descartado. Resultado: nenhum evento posterior ao ENTERQUEUE consegue mais escrever no `queue_log` daquele callid.
+
+**Workarounds avaliados e descartados:**
+- ❌ Trigger `fn_synth_connect_missing()` em `AFTER INSERT ON queue_log WHEN event IN ('COMPLETECALLER','COMPLETEAGENT')` — só funciona quando o COMPLETE chega; muitas chamadas não chegam nem nele
+- ❌ Sintetizar a partir do ENTERQUEUE com timeout — gera dados artificiais sem garantia de operador correto
+- ❌ Mexer no dialplan IZYDIAL (Set QUEUE_LOG_CHANNEL, desativar /n no Local) — depende de cooperação do cliente que controla o discador
+
+**Solução planejada (a fazer):** ativar a tabela **CEL (Channel Event Logging)** no Asterisk de produção e usar os eventos CEL (`CHAN_START`, `ANSWER`, `BRIDGE_ENTER`, `BRIDGE_EXIT`, `HANGUP`, `LINKEDID_END`) para reconstruir o atendimento das chamadas Cobranca. CEL captura o ciclo completo do canal independentemente do masquerade do `app_queue`, então cobre 100% dos casos. Após ativação, o pipeline será:
+1. Backend lê eventos CEL do banco
+2. Identifica chamadas Cobranca pelo `linkedid` casando com o `callid` do ENTERQUEUE
+3. Popula `t_monitor_voxcall`, `monitor_operador` e relatórios com base no CEL em vez do `queue_log`
+
+**Status (2026-04-22):** documentado e adiado para próxima sessão. Nenhuma implementação CEL feita ainda. Trigger `fn_synth_connect_missing` permanece ativa cobrindo o subconjunto de chamadas que recebem COMPLETE.
 
 ## Skills Relacionadas
 

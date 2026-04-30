@@ -953,7 +953,7 @@ exten => h,3,Set(OPERADOR_DATAHORA()=${MEMBERNAME})
 - Chamadas originadas via AMI → geram eventos queue_log (ENTERQUEUE, CONNECT, COMPLETE) → triggers VPS preenchem `t_monitor_voxcall` + `dialer_queue_log` + `dialer_agent_performance` automaticamente
 - `monitor_operador` consultado para verificar disponibilidade de operadores
 - Relatório de Operadores do Discador usa `dialer_agent_performance` (primário) ou `dialer_queue_log` (fallback) — NÃO usa AMI
-- O campo `canal` em `t_monitor_voxcall` fica vazio para chamadas do discador enquanto o CEL não estiver ativado no Asterisk
+- O campo `canal` em `t_monitor_voxcall` é populado pela trigger `monitor_voxcall()` no CONNECT, que lê de `canal_chamada` (alimentada pela trigger CEL `fn_cel_captura_canal` em CHAN_START). Ver seção "Habilitar CEL para captura de canal externo" na skill `asterisk-callcenter-expert` para os configs `cel.conf` / `cel_pgsql.conf` que habilitam o pipeline.
 
 **API endpoints** (role: administrator/superadmin):
 | Method | Endpoint | Description |
@@ -977,7 +977,15 @@ exten => h,3,Set(OPERADOR_DATAHORA()=${MEMBERNAME})
 - UNIQUE index faltando em `relatorio_operador(data, operador, fila)` na VPS — causava ROLLBACK de toda a cascade de triggers
 - Relatório de Operadores: removida captura AMI (operatorRamal/operatorName), substituída por trigger PostgreSQL `trg_dialer_agent_performance`
 
-**CEL pendente**: O campo `canal` de `t_monitor_voxcall` depende da tabela `canal_chamada`, preenchida pela trigger `fn_cel_captura_canal` no CEL. O CEL está desativado no Asterisk (ver asterisk-callcenter-expert skill para detalhes de ativação).
+**Pipeline CEL → canal_chamada → t_monitor_voxcall.canal**:
+- Tabela `cel` no PG do extdb DEVE ser `UNLOGGED` (a trigger BEFORE INSERT `trg_cel_captura_canal` retorna NULL, então `cel` nunca cresce — armazenamento zero). Validar com:
+  ```sql
+  SELECT relpersistence FROM pg_class WHERE relname='cel';  -- deve retornar 'u' (UNLOGGED)
+  ```
+- Se `cel` estiver como `'p'` (PERMANENT), fazer `DROP TABLE cel CASCADE` e recriar conforme `server/asterisk-schema.sql:984-1006` + reaplicar a trigger `trg_cel_captura_canal`.
+- Configurar `cel.conf` + backend (`cel_pgsql.conf` ou `cel_odbc.conf`) no Asterisk apontando para o mesmo PG do extdb. Ver skill `asterisk-callcenter-expert` seção "Habilitar CEL para captura de canal externo".
+
+**Lookup de protocolo no CONNECT (corrigido 2026-04-18)**: A função `monitor_voxcall()` busca protocolo em `protocolo` table. A tabela pode ter 2 rows com mesmo `callid`: um placeholder vazio + o valor real `DDMMYYYYHHMMSS` gerado por `fn_auto_queueid_protocolo`. O SELECT precisa filtrar `protocolo IS NOT NULL AND protocolo <> ''` com `ORDER BY protocolo DESC LIMIT 1` para garantir que pega o não-vazio. Ver `server/asterisk-schema.sql:407-413`.
 
 ### Report UI Conventions
 - Headers: `bg-blue-700` (group row), `bg-blue-600` (column row), white text
@@ -1339,7 +1347,8 @@ docker exec voxfone-db psql -U voxfone -d voxfone -c "ALTER USER voxfone WITH PA
 - **Welcome bar**: Top bar shows "Bem-vindo(a), {operador}" (left) and `LiveClock` component with full date + time updating every second (right)
 - **Login validations**: (1) Checks password, (2) Checks if ramal is in use by another operator in `monitor_operador` — returns 409 with operator name if so, (3) Cancels any pending auto-logout timer for the operator
 - **Login SIP credential hydration**: On login, `POST /api/agent/login` queries `agentes_tela` including `sip_ramal`/`sip_senha` columns. If saved credentials exist, they are loaded into the session (`sipExtension`/`sipPassword`), enabling auto-registration of the softphone without reconfiguration.
-- **Login ARI confirmation**: After successful login, fire-and-forget ARI Originate to `PJSIP/{ramal}` with extension `*13891` context `MANAGER` plays `agent-loginok` audio to confirm correct ramal
+- **Login ARI confirmation**: After successful login, fire-and-forget ARI Originate to `await buildEndpoint(ramal)` (resolves to `PJSIP/{ramal}` or `SIP/{ramal}` based on toggle) with extension `*13891` context `MANAGER` plays `agent-loginok` audio to confirm correct ramal
+- **Channel tech toggle (PJSIP vs SIP)**: All endpoint construction MUST use `await buildEndpoint(ramal)` from `server/asterisk-config.ts` — NEVER hardcode `` `PJSIP/${ramal}` `` or `` `SIP/${ramal}` ``. The helper reads the persisted config at `<configDir>/asterisk-config.json` (default `PJSIP`, 30s versioned cache, configurable via Settings UI / `PUT /api/asterisk/channel-tech` superadmin only). Affects: queue_member_table inserts (login + ring-then-sleep), supervisão (spy/whisper), Originate (dial), bulk extension endpoints, `/api/ari/extensions-status` (filter, regex, technology field). When adding any new code that talks to Asterisk endpoints, use `buildEndpoint(ramal)` and remember that it returns `Promise<string>` — must be awaited.
 - **Logout cache clear**: `logoutAgent()` in `useAgentAuth.ts` calls `queryClient.clear()` to wipe all React Query cache, ensuring fresh data (especially `timestamp_estado` for timer) on next login
 - **Copy-to-clipboard**: Telefone, Cód.Gravação, and Protocolo fields in the status table are clickable when they have a value — copies to clipboard with toast feedback ("Telefone copiado!" etc.). Cursor changes to pointer and text highlights blue on hover
 - **Change password**: KeyRound button in bottom bar opens Dialog with current/new/confirm password fields, show/hide toggles. `POST /api/agent/change-password` reads from REPLICA, writes to PRIMARY `agentes_tela`
