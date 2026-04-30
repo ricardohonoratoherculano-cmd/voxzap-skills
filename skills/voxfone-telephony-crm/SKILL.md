@@ -988,7 +988,52 @@ exten => h,3,Set(OPERADOR_DATAHORA()=${MEMBERNAME})
 | GET | `/api/dialer/reports/summary` | Resumo geral do discador |
 | GET | `/api/dialer/reports/attempts` | Relatório de tentativas |
 
-**Bugs corrigidos (2026-03-26/27)**:
+### Roteamento Asterisk por campanha (Implementado — 2026-04, Super Admin)
+
+Por padrão, `originateCall()` em `server/dialer-engine.ts` envia AMI Originate com `Application: Queue` + `Data: <queueName>,tT,,,30` — chamada cai direto na fila assim que o cliente atende. Para casos como AMD (detecção de URA), mensagem inicial ou roteamento condicional, cada campanha pode opcionalmente ser configurada para ir primeiro a um exten do dialplan, que decide quando entregar à fila.
+
+**Schema novo em `dialer_campaigns`** (aditivo, default mantém comportamento atual):
+- `originate_mode` text NOT NULL DEFAULT 'queue' — `'queue'` ou `'dialplan'`
+- `dialplan_context` text NULL — ex: `AMD_COBRANCA`
+- `dialplan_exten` text NULL — ex: `9991`
+- `dialplan_variables` jsonb NULL — `{"CAMPO1": "{{cpf}}", "CAMPO2": "{{nome}}"}`
+
+**Originate quando `originate_mode='dialplan'`**:
+```
+Channel:  LOCAL/<DDD+phone>@MANAGER/n
+Context:  <dialplan_context>
+Exten:    <dialplan_exten>
+Priority: 1
+Variable: CDR(userfield)=DISCADOR,DIALER_*=...,CAMPO1=<resolvido>,CAMPO2=<resolvido>
+```
+O dialplan então roda `AMD()`, branch `HUMAN`/`MACHINE`, e só cai em `Queue(...)` quando for humano.
+
+**Placeholders disponíveis em `dialplanVariables`** (resolvidos pelo `resolveDialplanVariables()` em `dialer-engine.ts`):
+- `{{nome}}`, `{{name}}` — record.name
+- `{{cpf}}`, `{{codcli}}`, `{{cod_cli}}` — record.codCli
+- `{{foco_id}}`, `{{foco}}` — record.focoId
+- `{{ddd}}` — record.ddd
+- `{{phone}}`, `{{telefone}}` — record.phone
+- `{{full_phone}}` — DDD+phone
+- `{{mailing_id}}` — record.id
+- Qualquer chave (lowercase) presente em `record.extraData`
+
+**UI**: aba colapsável "Roteamento Asterisk" no modal de criar/editar campanha em `client/src/pages/dialer-campaigns.tsx`, **renderizada APENAS** quando `useAuth().user.role === 'superadmin'`. Inclui radio queue/dialplan, inputs Context/Exten, lista key/value de variáveis com botão "+", e preview do Originate.
+
+**Defesas de segurança (CRÍTICO — AMI protocol injection)**:
+1. **Zod backend** em `shared/schema.ts` `insertDialerCampaignSchema`:
+   - `originateMode`: enum `["queue", "dialplan"]`
+   - `dialplanContext`/`dialplanExten`: regex `^[A-Za-z0-9_-]{1,64}$`
+   - `dialplanVariables`: keys via `^[A-Za-z_][A-Za-z0-9_()]{0,63}$`, values sem `\r\n`, máx 500 chars
+   - `superRefine`: se mode=dialplan, context+exten obrigatórios
+2. **Guard server-side** em `server/routes.ts` `stripDialplanFieldsIfNotSuperAdmin()`: nas rotas POST/PUT `/api/dialer/campaigns`, se `req.user.role !== 'superadmin'`, os 4 campos são removidos do body antes do parse — impossibilita escalation por API direta.
+3. **Defesa em profundidade no engine** `sanitizeAmiToken()`: re-aplica regex `^[A-Za-z0-9_-]{1,64}$` em `dialplanContext`/`dialplanExten` antes de escrever no socket AMI; aborta o originate se algo passou.
+4. **`escapeAmiVarValue()`**: remove `\r\n,` dos values e trunca a 200 chars antes de juntar via `,`.
+
+**Padrão para futuras adições no AMI Originate**: NUNCA passe valor de input do usuário direto pra `Context`/`Exten`/`Channel` sem sanitização. AMI é protocolo line-based — `\r\n` em qualquer field permite injetar `Action: Hangup` ou outros comandos.
+
+### Bugs corrigidos (2026-03-26/27)
+
 - `isRecordRetryReady()`: bloqueava registros com attempts=0 e lastAttemptAt preenchido — corrigido para só verificar intervalo quando attempts > 0
 - Timezone: usar `Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' })` para comparações de data
 - Registros órfãos: `recoverStaleDialingRecords()` no startup reseta registros travados em `dialing`
