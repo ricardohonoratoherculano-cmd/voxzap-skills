@@ -172,6 +172,7 @@ Sintoma típico antes do tuning: load average 7+ com 98% das CPUs ociosas — Do
 | Regex `phone-utils` sem âncora `^...$` | Contatos colapsam ou ganham lixo concatenado | Auditar regex + popular `numberOriginal` antes de qualquer normalização |
 | `tickets.findFirst` sem `whatsappId` | Nova Conversa devolve ticket de outro canal | Toda query por contato + status precisa filtrar canal |
 | `UsersQueues` órfãs | `GET /api/queues` HTTP 500 | DELETE de órfãs no fim de `migrate.py` |
+| Seed inicial cria `UserWhatsapps` em massa para todos os operadores em todos os canais | Operador vê histórico cross-canal de outros canais (sensação de "vazamento" entre filas) ao abrir tickets do mesmo contato | Após cutover, auditar `UserWhatsapps` × `UsersQueues` por operador. Vínculo de canal **não tem UI no projeto** — é só SQL. Ver seção "Permissão de Canal vs Permissão de Fila" em `whatsapp-messaging-expert`. Flag opcional `restrictHistoryToOperatorChannels` (Settings) restringe histórico cross-ticket sem precisar editar vínculos. |
 
 ## Checklist rápido pós-cutover
 

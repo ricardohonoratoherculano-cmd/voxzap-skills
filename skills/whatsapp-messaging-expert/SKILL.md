@@ -329,6 +329,55 @@ POST /api/webhook/whatsapp  →  Processamento de eventos
 // Comparação: crypto.timingSafeEqual
 ```
 
+#### Resolução do App Secret (resolveAppSecretFromPayload)
+
+O webhook resolve o App Secret dinamicamente por tenant:
+1. Extrai `phoneNumberId` do payload (`metadata.phone_number_id`)
+2. Busca a conexão `Whatsapps` pelo `tokenAPI = phoneNumberId`
+3. Busca o tenant pela conexão → campo `Tenants.metaToken`
+4. Se `metaToken` está configurado (não-vazio e diferente do padrão) → usa como App Secret
+5. Se não → fallback para `process.env.META_APP_SECRET` → se não existe → `null` (validation skipped)
+
+**Valor padrão (skip):** Definido como `META_TOKEN_DEFAULT` no código. Consulte o scratchpad do agente para o valor real.
+
+Função `isAppSecretConfigured(metaToken)` retorna `false` se:
+- metaToken é null/vazio
+- metaToken é igual ao `META_TOKEN_DEFAULT` acima
+
+#### TROUBLESHOOTING: "Invalid signature, rejecting payload"
+
+**Causa mais comum:** O campo `Tenants.metaToken` foi preenchido com um valor que NÃO corresponde ao App Secret real da aplicação Meta. Quando `isAppSecretConfigured()` retorna `true`, a validação HMAC-SHA256 é ativada e todos os webhooks falham com 403.
+
+**Sintoma:** TODAS as mensagens recebidas param de funcionar. Logs mostram:
+```
+[Webhook] POST received, entries=1
+[Webhook] Invalid signature, rejecting payload
+POST /api/webhook/whatsapp 403
+```
+
+**Diagnóstico:**
+```sql
+SELECT id, name, "metaToken" FROM "Tenants" WHERE id = 1;
+```
+
+**Correção imediata (desbloqueia webhooks):**
+```sql
+UPDATE "Tenants" SET "metaToken" = '<META_TOKEN_DEFAULT_FROM_SCRATCHPAD>' WHERE id = 1;
+```
+Isso reseta para o valor padrão, fazendo `isAppSecretConfigured()` retornar `false` e pular a validação.
+
+**Correção definitiva:** Obter o App Secret correto no Meta for Developers → App Settings → Basic → App Secret, e configurar no painel Webhook do VoxZap.
+
+#### rawBody Capture
+
+O `rawBody` é capturado em `server/index.ts` via `express.json({ verify })`:
+```typescript
+app.use(express.json({
+  verify: (req, _res, buf) => { req.rawBody = buf; },
+}));
+```
+O webhook usa `req.rawBody` (Buffer original) para validar a assinatura. Se `rawBody` não existe, faz fallback para `JSON.stringify(req.body)` — que pode diferir do payload original e causar falha de validação.
+
 ### Fluxo de Processamento
 
 ```
@@ -353,13 +402,26 @@ Webhook POST
           │   ├── Se inválido: incrementa tentativas, envia mensagem progressiva
           │   ├── Envia mensagem de confirmação (rating.message)
           │   └── Se já avaliou: envia ratingStoreAttemp
+          ├── ** Routing Chain (determina fila + shouldActivateBot) **
+          │   ├── 1. Force Wallet: walletUserId direto (se configurado)
+          │   ├── 2. Campaign Routing: CampaignContacts com responseRouting (janela 48h)
+          │   │   └── Se match: campaignRouted=true, walletQueueId = campaign.queueId
+          │   ├── 3. Tag Routing (SEMPRE roda, mesmo com campaign/wallet):
+          │   │   ├── Busca ContactTags → TagQueueRoutes (ativas, priority DESC)
+          │   │   ├── Se !walletUserId && !campaignRouted: routing completo (tagRouted=true, define fila)
+          │   │   └── Se já roteado E tag.skipBot=true: tagSkipBotOnly=true (mantém fila, desativa bot)
+          │   ├── 4. VoxCall Routing: busca por número na VoxCall
+          │   └── 5. Default: fila padrão da conexão + bot ativo
           ├── Encontra/cria Ticket (status pending)
-          │   └── Auto-atribui queueId da conexão WhatsApp
+          │   └── queueId definido pela Routing Chain acima
           ├── Extrai conteúdo (extractMessageContent)
           ├── Salva mensagem no banco
           ├── Atualiza lastMessage do ticket
           ├── Broadcast via Socket.io: NEW_MESSAGE + TICKET_UPDATE
-          └── ** AI Agent Processing (se ticket pending + connection.aiAgentId) **
+          ├── ** shouldActivateBot check **
+          │   ├── Se (tagRouted && tagRoutedSkipBot) || tagSkipBotOnly → shouldActivateBot=false
+          │   └── Se connection.aiAgentId → shouldActivateBot=true (default)
+          └── ** AI Agent Processing (se shouldActivateBot=true + ticket pending) **
               ├── Re-lê ticket do banco (freshTicket) para checar lastCallChatbot
               ├── Se lastCallChatbot === false: SKIP (bot desativado após transferência)
               ├── Auto-reply loop detection: se últimas 3 msgs incoming idênticas → desativa bot
@@ -377,6 +439,18 @@ Webhook POST
               │   └── Se transferred: tryTransfer() já cuida de tudo (BH check, status, queueId)
               └── tryTransfer(): businessHoursCheck → transfere se aberto, mensagem de fechamento se fechado (SEMPRE informa o cliente)
 ```
+
+### Proteção contra Tickets Duplicados (Race Condition)
+
+A Meta pode enviar múltiplos webhooks simultaneamente (mesmo messageId 2x, ou mensagens diferentes do mesmo contato no mesmo instante). Sem proteção, `findOrCreateTicket` cria tickets duplicados.
+
+**3 camadas de proteção em `webhook.service.ts`:**
+
+1. **Deduplicação em memória por messageId** (`recentMessageIds: Set`): Cada messageId é marcado por 30s. Se a Meta envia o mesmo webhook 2x, o segundo é descartado antes de qualquer query ao banco. Log: `"already being processed (in-memory dedup), skipping"`
+2. **Mutex por contato** (`contactTicketLocks: Map`): Lock em memória por `tenantId:contactId`. Quando 2 mensagens diferentes do mesmo contato chegam simultaneamente, a segunda espera a primeira criar o ticket. Garante serialização do `findOrCreateTicket` por contato.
+3. **Índice parcial único no banco** (`idx_tickets_one_open_per_contact`): `UNIQUE INDEX ON "Tickets" ("contactId", "tenantId", COALESCE("whatsappId", 0)) WHERE status IN ('open','pending','paused')`. Se as camadas 1 e 2 falharem (restart, multi-instância), o PostgreSQL rejeita a criação. O código trata `P2002` fazendo fallback para buscar o ticket existente.
+
+**IMPORTANTE para migração**: O índice é parcial (só tickets ativos). Tickets `closed` (dados históricos) não são afetados — migrações podem importar múltiplos tickets fechados do mesmo contato sem conflito.
 
 ### Proteção contra Loop Infinito de Auto-Reply
 
@@ -604,6 +678,94 @@ model TicketEvaluations {
 
 **Proteção contra race condition:** O `prisma.ticketEvaluations.create()` está envolvido em try/catch que detecta erro Prisma P2002 (unique violation). Se duas mensagens de avaliação chegarem simultaneamente, a segunda é tratada como sucesso (sem erro para o cliente) em vez de criar duplicata.
 
+#### Marcador "skipped" — Fechamento Forçado Sem Avaliação
+
+Quando o operador fecha um ticket pelo **X vermelho do card** (atendimento) ou pelo **bulk-close do painel admin**, NÃO queremos enviar a pesquisa nem queremos que a próxima mensagem do cliente caia no `handleEvaluationResponse`.
+
+**Problema histórico:** Sem nenhum marcador, `handleEvaluationResponse` continuava interceptando toda mensagem do contato dentro de `ratingStoreTime` (1h padrão), mandando "Resposta inválida" → "Você tem mais uma oportunidade..." → "Número máximo de tentativas atingido", mesmo o ticket tendo sido encerrado SEM cobrança de pesquisa.
+
+**Solução:** Gravar uma linha em `TicketEvaluations` com `evaluation: "skipped"` e `attempts: 0`. Como `handleEvaluationResponse` já checa `existingEvalCheck` e retorna `false` se houver qualquer linha pra aquele ticket, o marcador silencia o fluxo de cobrança permanentemente para aquele encerramento.
+
+**Backend** (`server/routes.ts`):
+
+```ts
+// PATCH /api/tickets/:id — schema aceita skipEvaluation
+const updateTicketSchema = z.object({
+  status: z.enum(["pending", "open", "closed"]).optional(),
+  // ... outros campos
+  skipEvaluation: z.boolean().optional(),
+});
+
+// Após o updatedTicket + broadcast, ANTES do bloco de envio de pesquisa:
+if (status === "closed" && skipEvaluation === true && ticket.whatsappId) {
+  try {
+    await prisma.ticketEvaluations.create({
+      data: {
+        ticketId,
+        tenantId: req.user.tenantId,
+        userId: req.user.userId,
+        evaluation: "skipped",
+        attempts: 0,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
+  } catch (skipErr: any) {
+    if (skipErr?.code !== "P2002") console.error("...", skipErr);
+  }
+}
+
+// O bloco de envio de pesquisa (sendEvaluation) também checa skipEvaluation:
+if (status === "closed" && ticket.whatsappId && resolveContactRecipient(ticket.contact)) {
+  if (skipEvaluation) {
+    // pula tudo: não envia farewellMessage nem pesquisa
+  } else {
+    // envia farewell + pesquisa normalmente
+  }
+}
+
+// POST /api/tickets/bulk-close — busca IDs antes do updateMany e cria markers
+const ticketsToClose = await prisma.tickets.findMany({
+  where, select: { id: true, whatsappId: true, userId: true },
+});
+await prisma.tickets.updateMany({ where, data: { status: "closed", ... } });
+const evalMarkers = ticketsToClose
+  .filter((t) => t.whatsappId)
+  .map((t) => ({
+    ticketId: t.id,
+    tenantId: req.user.tenantId,
+    userId: t.userId ?? req.user.userId,
+    evaluation: "skipped",
+    attempts: 0,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  }));
+if (evalMarkers.length > 0) {
+  await prisma.ticketEvaluations.createMany({ data: evalMarkers, skipDuplicates: true });
+}
+```
+
+**Frontend** (`client/src/pages/atendimento.tsx`):
+
+```ts
+// X vermelho do card passa skipEvaluation=true
+const handleCloseTicket = (ticket: Ticket, skipEvaluation = false) => {
+  updateTicketMutation.mutate({ id: ticket.id, status: "closed", skipEvaluation });
+};
+// X vermelho:
+<button onClick={() => handleCloseTicket(ticket, true)}>X</button>
+// Botão de "Finalizar com pesquisa" no topbar: handleCloseTicket(ticket, false)
+```
+
+**Correção retroativa de tickets já fechados sem marker:** Se o usuário reportar "cliente continua recebendo cobrança de pesquisa", inserir manualmente:
+
+```sql
+INSERT INTO "TicketEvaluations"
+  ("evaluation", "attempts", "ticketId", "userId", "tenantId", "createdAt", "updatedAt")
+VALUES ('skipped', 0, <ticket_id>, <user_id>, <tenant_id>, NOW(), NOW())
+ON CONFLICT ("ticketId", "tenantId") DO NOTHING;
+```
+
 #### Código-Chave
 
 - **Envio ao fechar:** `server/routes.ts` → `PATCH /api/tickets/:id` (bloco `if status === "closed"`)
@@ -633,50 +795,76 @@ model TicketEvaluations {
 
 ### Regra do 9° Dígito
 
-Todos os DDDs do Brasil já implementaram o nono dígito para celulares (desde Nov/2016). Porém, a API do WhatsApp da Meta tem comportamento diferente por região:
+Todos os celulares brasileiros usam o nono dígito (9) desde Nov/2016 em todos os DDDs. A Meta Cloud API aceita ambos os formatos e normaliza internamente. O sistema sempre envia COM o nono dígito para garantir entrega.
 
-| DDD | Formato WhatsApp API | Comprimento Total | Regra |
-|-----|---------------------|-------------------|-------|
-| 11-28 | `55` + DDD + `9XXXXXXXX` | 13 dígitos | COM nono dígito |
-| 31-99 | `55` + DDD + `XXXXXXXX` | 12 dígitos | SEM nono dígito |
+| Formato | Comprimento | Regra |
+|---------|-------------|-------|
+| `55` + DDD + `9XXXXXXXX` | 13 dígitos | COM nono dígito (formato padrão) |
+| `55` + DDD + `XXXXXXXX` | 12 dígitos | SEM nono dígito (formato alternativo para retry) |
 
 ### Função `normalizeBrazilianPhone()`
 
-Presente em: `whatsapp.service.ts`, `webhook.service.ts`, `calling.service.ts`, `voxcall-integration.service.ts`
+Centralizada em: `server/lib/phone-utils.ts` (importada por todos os serviços)
 
 ```typescript
 function normalizeBrazilianPhone(phone: string): string {
-  // 1. Remove não-dígitos e adiciona DDI 55 se necessário
-  // 2. DDDs 11-28: adiciona 9 se tem apenas 8 dígitos locais
-  // 3. DDDs 31-99: remove 9 se tem 9 dígitos locais começando com 9
+  // 1. Remove não-dígitos e adiciona DDI 55 se necessário (10 ou 11 dígitos → 55 + número)
+  // 2. Se número local tem 8 dígitos e não começa com 0 (fixo): ADICIONA o 9
+  // NUNCA remove o nono dígito — a Meta normaliza do lado deles
 }
 ```
 
 ### Função `getAlternatePhoneNumber()`
 
-Gera o número no formato alternativo (com/sem o 9) para busca de contatos e retry de envio.
+Gera o número no formato alternativo (com/sem o 9) para busca de contatos e retry de envio:
+- Se tem 9 dígitos locais começando com 9 → gera versão SEM o 9 (12 dígitos)
+- Se tem 8 dígitos locais → gera versão COM o 9 (13 dígitos)
+
+### Função `buildPhoneSearchNumbers()`
+
+Centralizada em: `server/lib/phone-utils.ts`. Gera TODAS as variantes de busca para um número de telefone, garantindo match com contatos armazenados em qualquer formato (legado ou normalizado).
+
+Para o número `5585976020655`, gera:
+1. `5585976020655` — normalizado completo (13 dígitos)
+2. `558576020655` — sem nono dígito (12 dígitos)
+3. `85976020655` — sem DDI, com nono dígito (11 dígitos)
+4. `8576020655` — sem DDI, sem nono dígito (10 dígitos)
+5. O número raw original (se diferente dos acima)
+
+**Isso é essencial para contatos migrados (ex: Locktec) que podem estar armazenados sem o DDI `55`.** Sem essas variantes sem DDI, o webhook não encontra o contato existente e cria um duplicado, causando tickets duplicados.
 
 ### Retry Automático no Envio (`sendToMeta`)
 
 Se o envio falhar com erro de destinatário (códigos 131026, 100, subcodes 2388055, 1245301, ou mensagem contendo "recipient"), o sistema automaticamente:
-1. Gera o número alternativo (com/sem 9° dígito)
+1. Gera o número alternativo (sem 9° dígito) via `getAlternatePhoneNumber()`
 2. Tenta enviar novamente com o formato alternativo
 3. Se o retry funcionar, retorna sucesso normalmente
 
 ### Busca de Contatos Anti-Duplicação
 
 Na recepção de mensagens (`findOrCreateContact` em `webhook.service.ts`) e chamadas (`calling.service.ts`):
-1. Normaliza o número recebido
-2. Busca no banco por AMBAS as variações (com e sem o 9) usando `{ in: [...] }`
-3. Se encontrar contato com número no formato antigo, atualiza automaticamente para o formato normalizado
-4. Evita criação de contatos duplicados para o mesmo número
+1. Normaliza o número recebido via `normalizeBrazilianPhone()`
+2. Gera todas as variantes via `buildPhoneSearchNumbers()` (com/sem DDI, com/sem nono dígito)
+3. Busca no banco por TODAS as variações usando `{ in: searchNumbers }`
+4. Se encontrar contato com número no formato antigo, atualiza automaticamente para o formato normalizado
+5. Evita criação de contatos duplicados para o mesmo número
+
+### Auto-Normalização na Nova Conversa
+
+O endpoint `POST /api/new-conversation`, quando recebe um `contactId` de contato existente:
+1. Verifica se o número do contato está normalizado
+2. Se não estiver (ex: sem DDI `55`), normaliza automaticamente
+3. Verifica conflito antes de atualizar (proteção anti-duplicata com check Prisma P2002)
+4. Log: `[NewConversation] Auto-normalizing contact X number from Y to Z`
 
 ### IMPORTANTE
 
 - A normalização é aplicada em TODOS os pontos de envio (texto, template, mídia, interativo, localização, contato, reação)
 - A normalização NÃO se aplica a números internacionais (sem DDI 55)
-- Números de telefone fixo (8 dígitos sem 9) em DDDs 31-99 são mantidos como estão (12 dígitos)
+- Números de telefone fixo (começam com 0) são mantidos como estão
 - A rota `POST /api/contacts/check-ninth-digit` existe para correção em massa de contatos existentes
+- NUNCA remover o nono dígito na normalização — a Meta aceita ambos os formatos e faz a normalização interna
+- `buildPhoneSearchNumbers()` DEVE gerar variantes sem DDI para compatibilidade com dados migrados de sistemas legados
 
 ## Contatos (Contacts)
 
@@ -688,6 +876,7 @@ Na recepção de mensagens (`findOrCreateContact` em `webhook.service.ts`) e cha
 | `POST /api/contacts` | Criar novo contato (name, number, email, tenantId) |
 | `GET /api/contacts/:id` | Detalhes do contato com ContactWallets, ContactTags, ContactCustomFields |
 | `PUT /api/contacts/:id` | Atualizar contato |
+| `DELETE /api/contacts/:id` | Excluir contato + cascateia tickets, mensagens, anotações etc. (ver "Exclusão de Contato") |
 | `GET /api/contacts/:id/messages` | Histórico de mensagens do contato (paginado, todas as fontes) |
 | `GET /api/contacts/export` | Exportar CSV com BOM (Excel-compatible) |
 | `POST /api/contacts/check-ninth-digit` | Verificar/adicionar 9° dígito em números brasileiros |
@@ -707,6 +896,107 @@ A busca (`search` query param) pesquisa em: `name`, `number`, `email`, `pushname
 ### IMPORTANTE - Ordem de Rotas no Express
 
 Rotas estáticas (`/api/contacts/export`, `/api/contacts/check-ninth-digit`, etc.) e `POST /api/contacts` DEVEM ser registradas ANTES de `/api/contacts/:id` para evitar que Express interprete "export" como um `:id`.
+
+### Exclusão de Contato (DELETE /api/contacts/:id)
+
+Excluir um contato é **destrutivo total**: remove o contato em si E todo o histórico vinculado (tickets, mensagens, anotações, campanhas, etiquetas, custom fields, transcrições, summaries de IA, etc.).
+
+#### Mapa de FKs de `Contacts` → relações
+
+A maioria dos modelos referencia `Contacts` com `onDelete: Cascade` e cascateia automaticamente:
+- `Tickets` (Cascade) → cujos children também cascateiam: `Messages`, `MessagesOffLine`, `LogTickets`, `MessageUpserts`, `TicketActionLogs`, `TicketShareds`, `TicketParticipants`, `OperatorKanbanTickets`
+- `BirthdayMessagesSents`, `CampaignContacts`, `ContactCustomFields`, `ContactTags`, `ContactUpserts`, `ContactWallets`, `Messages`(direto), `MessagesOffLine`(direto), `Opportunitys` — todos Cascade
+
+Modelos que apontam pra `Contacts` (ou pra `Tickets` filhos) com **`Restrict`** (default ou explícito) **bloqueiam o delete** se não forem limpos antes:
+- `AutoReplyLogs.contactId` (Restrict)
+- `AutoReplyLogs.ticketId` (default = Restrict)
+- `UserMessagesLog.ticketId` (default = Restrict)
+- `CallTranscriptions.contactId` (default = Restrict, relation field `contact`)
+- `InteractionSummaries.contactId` (default = Restrict, relation field `contact`)
+
+#### Padrão correto do endpoint
+
+```ts
+app.delete("/api/contacts/:id", authenticateToken, async (req: any, res) => {
+  try {
+    const tenantId = req.user.tenantId;
+    const id = parseInt(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ message: "ID inválido" });
+
+    const contact = await prisma.contacts.findFirst({
+      where: { id, tenantId }, select: { id: true, name: true },
+    });
+    if (!contact) return res.status(404).json({ message: "Contato nao encontrado" });
+
+    await prisma.$transaction(async (tx) => {
+      const tickets = await tx.tickets.findMany({
+        where: { contactId: id, tenantId }, select: { id: true },
+      });
+      const ticketIds = tickets.map((t) => t.id);
+
+      // Restrict FKs em Tickets — limpar antes do cascade
+      if (ticketIds.length > 0) {
+        await tx.userMessagesLog.deleteMany({ where: { ticketId: { in: ticketIds } } });
+        await tx.autoReplyLogs.deleteMany({ where: { ticketId: { in: ticketIds } } });
+      }
+      // Restrict FKs em Contacts
+      await tx.callTranscriptions.deleteMany({ where: { contactId: id } });
+      await tx.interactionSummaries.deleteMany({ where: { contactId: id } });
+      await tx.autoReplyLogs.deleteMany({ where: { contactId: id } });
+
+      // Agora seguro — cascade cuida do resto
+      await tx.contacts.delete({ where: { id } });
+    }, { timeout: 60000, maxWait: 5000 });
+
+    return res.json({ success: true, message: "Contato excluído" });
+  } catch (error) {
+    console.error("[Contacts] Delete error:", error);
+    return res.status(500).json({ message: "Erro ao excluir contato" });
+  }
+});
+```
+
+**Sempre** elevar o timeout do `$transaction` para contatos com muitos tickets/mensagens — o default de 5s estoura facilmente em base grande (Locktec tem contatos com 1k+ mensagens).
+
+### Ações na Tabela de Contatos (Frontend)
+
+Em `client/src/pages/contatos.tsx` cada linha tem 4 ícones na coluna "Ações", todos envolvidos em `<Tooltip>` (o `TooltipProvider` é global em `App.tsx`, não precisa wrap local):
+
+| Ícone | Tooltip | Ação |
+|-------|---------|------|
+| `Eye` | "Ver informações" | `setSelectedContactId(contact.id)` — abre painel lateral de detalhes |
+| `Edit` | "Editar contato" | `handleOpenEdit(contact.id)` — abre dialog de edição |
+| `Ban` (verde se bloqueado, vermelho caso contrário) | "Bloquear contato" / "Desbloquear contato" | `blockMutation.mutate(...)` |
+| `Trash2` (vermelho) | "Excluir contato" | `setDeleteContactTarget({ id, name })` — abre `AlertDialog` de confirmação |
+
+**Padrão de confirmação (AlertDialog):** o delete usa um state `deleteContactTarget` separado do state genérico `confirmAction` (que é usado pra ações em massa como "Remover Duplicados"). O AlertDialog tem botão "Excluir" em vermelho (`bg-red-600 hover:bg-red-700`), e a `AlertDialogCancel` fica desabilitada enquanto `deleteContactMutation.isPending`.
+
+```tsx
+<AlertDialog
+  open={!!deleteContactTarget}
+  onOpenChange={(open) => { if (!open && !deleteContactMutation.isPending) setDeleteContactTarget(null); }}
+>
+  <AlertDialogContent data-testid="dialog-delete-contact">
+    <AlertDialogHeader>
+      <AlertDialogTitle>Excluir contato?</AlertDialogTitle>
+      <AlertDialogDescription>
+        Tem certeza que deseja excluir <strong>{deleteContactTarget?.name}</strong>?
+        Esta ação remove o contato e todos os dados vinculados ... e não pode ser desfeita.
+      </AlertDialogDescription>
+    </AlertDialogHeader>
+    <AlertDialogFooter>
+      <AlertDialogCancel disabled={deleteContactMutation.isPending}>Cancelar</AlertDialogCancel>
+      <AlertDialogAction
+        onClick={() => deleteContactTarget && deleteContactMutation.mutate(deleteContactTarget.id)}
+        disabled={deleteContactMutation.isPending}
+        className="bg-red-600 hover:bg-red-700 focus:ring-red-600"
+      >
+        Excluir
+      </AlertDialogAction>
+    </AlertDialogFooter>
+  </AlertDialogContent>
+</AlertDialog>
+```
 
 ## Tickets
 
@@ -824,18 +1114,35 @@ Contatos com tags específicas são automaticamente direcionados para filas mape
 | `DELETE /api/tag-queue-routes/:id` | Remove mapeamento com validação tenant |
 
 **Fluxo no webhook (`findOrCreateTicket`):**
-1. Após wallet routing check, se `walletUserId` não foi atribuído:
-2. Busca tags do contato via `ContactTags`
-3. Verifica `TagQueueRoutes` ativas para essas tags (filtra tag/queue ativas)
-4. Se encontrar match: sobrescreve `walletQueueId` com a fila mapeada
-5. Se `skipBot = true`: define `shouldActivateBot = false` → ticket entra como `pending` na fila mapeada, sem bot
+
+A verificação de tags roda **SEMPRE**, independente de campaign/wallet routing:
+
+1. Busca tags do contato via `ContactTags`
+2. Verifica `TagQueueRoutes` ativas para essas tags (filtra tag/queue ativas, ordenadas por `priority DESC`)
+3. **Se NÃO há campaign/wallet routing:** tag routing completo — define `tagRouted=true`, `walletQueueId`, `tagRoutedSkipBot`, e `tagRoutedGreeting`
+4. **Se JÁ há campaign/wallet routing E a tag tem `skipBot=true`:** ativa `tagSkipBotOnly=true` — mantém a fila da campanha/wallet mas desativa o bot
+5. Na decisão de ativar bot: `if ((tagRouted && tagRoutedSkipBot) || tagSkipBotOnly)` → `shouldActivateBot = false`
+
+**Variáveis chave:**
+- `tagRouted` — tag routing completo (sem campaign/wallet)
+- `tagSkipBotOnly` — tag override de skipBot quando campaign/wallet já roteou (CRÍTICO: não substitui a fila, apenas desativa o bot)
+- `tagRoutedSkipBot` — valor do campo `skipBot` da TagQueueRoute encontrada
+- `tagRoutedGreeting` — mensagem de saudação da rota (só enviada em tag routing completo)
+
+**Logs de diagnóstico:**
+- `[Webhook] Tag routing: contact X has tag "Y" -> queue "Z" (id=N, skipBot=B, priority=P)` — routing completo
+- `[Webhook] Tag routing skipBot: contact X has tag "Y" with skipBot=true (campaign/wallet routed, applying skipBot only)` — apenas skipBot
+- `[Webhook] Bot skipped due to tag routing for contact X` — bot efetivamente desativado
+- `[Webhook] Bot skipped due to tag routing for contact X (skipBot only, queue from other source)` — bot desativado, fila veio da campanha/wallet
 
 **Ordem de prioridade no roteamento:**
-`Force Wallet` > `Tag Routing` > `VoxCall Routing` > `Fila padrão + Bot`
+`Force Wallet` > `Campaign Routing (48h window)` > `Tag Routing (fila)` > `VoxCall Routing` > `Fila padrão + Bot`
 
-**LogTickets:** Cria entrada `type: "tagRouting"` com `queueId` quando o roteamento por tag é ativado.
+**IMPORTANTE:** Tag `skipBot` é um **override transversal** — mesmo que a fila venha de Campaign ou Wallet routing, a tag com `skipBot=true` desativa o bot. A tag NÃO substitui a fila quando campaign/wallet já definiram uma.
 
-**UI Admin:** Card "Roteamento por Tag" em `configuracoes.tsx` — lista mapeamentos, adiciona/remove, toggle ativo/inativo.
+**LogTickets:** Cria entrada `type: "tagRouting"` com `queueId` quando o roteamento por tag completo é ativado.
+
+**UI Admin:** Card "Roteamento por Tag" em `configuracoes.tsx` — lista mapeamentos, adiciona/remove, toggle ativo/inativo, toggle "Pular Bot", prioridade numérica, mensagem de saudação.
 
 ### Transferência
 
@@ -856,6 +1163,34 @@ Body: { userId?: number, queueId?: number }
 **canAccessTicket após transferência:**
 - Após transferência, o ticket.userId muda para o novo operador
 - `canAccessTicket()` verifica `ticket.userId === user.userId` como check prioritário — operador que recebeu a transferência tem acesso imediato, independente de pertencer à fila
+
+### Permissão de Canal vs Permissão de Fila (UserWhatsapps × UsersQueues)
+
+São **dois vínculos independentes** e frequentemente confundidos. Tela de operadores (`client/src/pages/operadores.tsx`) mostra **apenas as filas** — o vínculo de canal hoje **não tem UI no projeto** e fica invisível ao admin.
+
+| Vínculo | Tabela | Cardinalidade | Função |
+|---|---|---|---|
+| **Operador ↔ Fila** | `UsersQueues` | M:N (`userId`, `queueId`) | Roteia novos tickets / distribuição automática para o operador |
+| **Operador ↔ Canal** | `UserWhatsapps` (id, userId, whatsappId, isActive, createdAt, updatedAt) | M:N | **Permissão de visibilidade** dos atendimentos do canal |
+| **Canal → Fila padrão** | `Whatsapps.queueId` (NULLABLE) | **1:1** | Fila default para novos tickets entrando naquele canal — NÃO é permissão |
+| **Canal ↔ Filas** (M:N) | **NÃO EXISTE** | — | Não há tabela `QueueWhatsapps` no schema atual |
+
+**Implicações operacionais:**
+
+1. **Não há UI nem endpoint para criar/editar `UserWhatsapps` no VoxZap** — `rg "UserWhatsapps" server/` só retorna leituras na flag `restrictHistoryToOperatorChannels`. A configuração foi herdada de seeds/migrações iniciais e só pode ser ajustada por SQL direto no banco.
+
+2. **Vínculos órfãos do seed inicial são comuns**: no onboarding do Locktec, todos os operadores foram vinculados a múltiplos canais na mesma data/hora (script de bootstrap), independente de quais filas eles atendiam. Isso gera operadores de cobrança com vínculo a canal Locktec (e vice-versa) — alimenta a sensação de "vazamento cross-canal" mesmo quando a permissão técnica está correta.
+
+3. **Flag `restrictHistoryToOperatorChannels`** (Settings, default off; `server/routes.ts` ~L2068 e ~L2763) é o único ponto que usa `UserWhatsapps` para gating: quando ativada, o histórico cross-ticket de `/api/tickets/:id/messages` e `/api/contacts/:id/messages` é filtrado para tickets cujo `whatsappId` pertença aos canais vinculados ao operador (`UserWhatsapps.isActive=true`). O ticket atual sempre é visível; admin/super passam direto.
+
+4. **Para auditar/corrigir vínculos por SQL**: classifique os operadores por `UsersQueues` (filas que ele atende) e compare com `UserWhatsapps` (canais que ele pode ver). Se houver descompasso (operador só atende fila X mas tem vínculo a canal Y onde fila X não roteia), revogue. Caso real documentado: forensic do ticket #212280 (Locktec, abr/2026) — `Andreza Maria` (filas Cobrança Receptiva + Cobrança Ativa) tinha vínculo a Locktec **e** CobrancaAtiva no `UserWhatsapps`; o vínculo Locktec foi removido (DELETE do registro). Mesma correção aplicada em Juliana Figueiredo e Mariana Barbosa.
+
+5. **Sempre fazer backup antes de mexer em UserWhatsapps em produção**:
+   ```bash
+   docker exec <client>-db pg_dump -U voxzap -d voxzap \
+     -t '"UserWhatsapps"' --data-only --column-inserts \
+     > /opt/tenants/<client>/backups/userwhatsapps-pre-fix-$(date +%Y%m%d).sql
+   ```
 
 ### Tabs da Interface (atendimento.tsx)
 
@@ -964,7 +1299,8 @@ await prisma.$executeRawUnsafe(
 findByEmail(email)                          // Login (inclui tenant)
 findById(id)                                // Por ID (inclui tenant)
 updatePresence(userId, status, isOnline)    // Atualizar presença
-setOnline(userId) / setOffline(userId)      // Helpers de presença
+setOnline(userId)                           // Conexão WebSocket/login — PRESERVA status "pause"
+setOffline(userId)                          // Desconexão WebSocket — PRESERVA status "pause"
 findOperatorsWithStats(tenantId)            // Operadores com contagem de tickets
 ```
 
@@ -1129,6 +1465,81 @@ Body: { components: [...] }
 DELETE /{version}/{wabaId}/message_templates?name={templateName}
 ```
 
+### Rotas Internas (Multi-Canal WABA)
+
+Cada cliente pode ter **N conexões WABA** ao mesmo tempo (ex: WABA principal + WABA secundário com outro número). As rotas internas aceitam `whatsappId` opcional e roteiam para o WABA correto via `templateService.getConnectionForTemplates(tenantId, whatsappId)`.
+
+| Rota | Onde vai `whatsappId` | Quando obrigatório |
+|------|----------------------|--------------------|
+| `GET /api/templates?whatsappId=N` | Query string | Opcional — sem ele pega o **primeiro WABA com `status=CONNECTED`** (`findFirst`) |
+| `POST /api/templates` | Body | Opcional — mesma fallback |
+| `PUT /api/templates/:id` | Body | Opcional — mesma fallback |
+| `DELETE /api/templates/:name?whatsappId=N` | Query string | Opcional — mesma fallback |
+
+```ts
+// server/services/template.service.ts → getConnectionForTemplates()
+const where: any = { tenantId, type: "waba", isDeleted: false, isActive: true,
+                     wabaId: { not: null }, bmToken: { not: null } };
+if (whatsappId) where.id = whatsappId;
+else where.status = "CONNECTED";
+return prisma.whatsapps.findFirst({ where, select: { id, wabaId, bmToken, wabaVersion, name } });
+```
+
+#### Armadilha: cliente "não vê todos os templates"
+
+Se o cliente reporta que faltam templates na tela, **quase sempre** é porque tem mais de uma conexão WABA cadastrada e a tela só estava puxando do primeiro `CONNECTED` (sem filtro de canal). Os templates "sumidos" são na verdade de outro `wabaId`. Solução: confirmar quantos canais WABA o tenant tem e usar o seletor de canal na tela (ver Frontend Multi-Canal abaixo).
+
+### Tela de Templates (Frontend Multi-Canal)
+
+`client/src/pages/templates.tsx` precisa rotear todas as chamadas para o canal WABA selecionado:
+
+```tsx
+// 1. Carrega lista de canais WABA
+const { data: whatsappsData } = useQuery<{ connections: Array<{
+  id: number; name: string; type: string; status: string; wabaId: string | null;
+}> }>({ queryKey: ["/api/whatsapps"] });
+
+const wabaChannels = (whatsappsData?.connections || []).filter(c => c.type === "waba" && c.wabaId);
+
+// 2. State + auto-select do primeiro CONNECTED (fallback: primeiro da lista)
+const [selectedWhatsappId, setSelectedWhatsappId] = useState<number | null>(null);
+useEffect(() => {
+  if (selectedWhatsappId !== null || wabaChannels.length === 0) return;
+  const firstConnected = wabaChannels.find(c => c.status === "CONNECTED");
+  setSelectedWhatsappId((firstConnected || wabaChannels[0]).id);
+}, [wabaChannels, selectedWhatsappId]);
+
+// 3. Query principal: queryKey inclui o whatsappId, enabled aguarda auto-select
+const { data } = useQuery<TemplatesResponse>({
+  queryKey: ["/api/templates", { whatsappId: selectedWhatsappId ?? undefined }],
+  enabled: selectedWhatsappId !== null,
+});
+
+// 4. Mutations passam whatsappId:
+//    POST/PUT → no body: { ..., whatsappId: selectedWhatsappId }
+//    DELETE  → na URL: `/api/templates/${name}?whatsappId=${selectedWhatsappId}`
+
+// 5. Topbar tem o <Select> de canal (só renderiza se >0 canais):
+{wabaChannels.length > 0 && (
+  <Select value={String(selectedWhatsappId)} onValueChange={(v) => setSelectedWhatsappId(parseInt(v))}>
+    <SelectTrigger data-testid="select-waba-channel"><SelectValue placeholder="Canal WABA" /></SelectTrigger>
+    <SelectContent>
+      {wabaChannels.map(c => (
+        <SelectItem key={c.id} value={String(c.id)}>
+          {c.name}{c.status !== "CONNECTED" && " (desconectado)"}
+        </SelectItem>
+      ))}
+    </SelectContent>
+  </Select>
+)}
+```
+
+**Pontos críticos:**
+- O `queryKey: ["/api/templates", { whatsappId: ... }]` aproveita o `getQueryFn` global (`client/src/lib/queryClient.ts` linha 124) que serializa o segundo elemento do array como query string automaticamente. Por isso NÃO precisa montar URL manualmente nem definir `queryFn` próprio.
+- `enabled: selectedWhatsappId !== null` evita um fetch sem filtro antes do auto-select acontecer (que pegaria do primeiro CONNECTED no backend e depois recarregaria — flicker).
+- Na invalidação `queryClient.invalidateQueries({ queryKey: ["/api/templates"] })` o React Query usa **prefix match** por padrão, então invalida todas as variantes (todos os canais), o que é o desejado quando uma mutation acontece em um canal específico.
+- Canais desconectados também aparecem no dropdown (com sufixo "(desconectado)") porque o `wabaId` continua válido — útil pra ver/limpar templates de canais desativados.
+
 ### Envio de Template
 
 ```typescript
@@ -1152,6 +1563,157 @@ DELETE /{version}/{wabaId}/message_templates?name={templateName}
   }
 }
 ```
+
+### ⚠️ Armadilhas e Correções Críticas no Envio de Template
+
+**Lições aprendidas em produção Locktec (2026-04-21).** Toda implementação nova deve respeitar:
+
+#### 1. `parameter_format`: POSITIONAL vs NAMED
+A Meta tem dois formatos de placeholder no body de templates:
+
+| Formato | Sintaxe no template | Como enviar parâmetros |
+|---|---|---|
+| `POSITIONAL` (legado) | `{{1}}`, `{{2}}` | `{ type: "text", text: "valor" }` na ordem |
+| `NAMED` (novo) | `{{nome_var}}` | `{ type: "text", parameter_name: "nome_var", text: "valor" }` |
+
+**Templates NAMED enviados como POSITIONAL falham com erro `(#132000)`**. O campo a inspecionar é `template.parameter_format` retornado por `GET /message_templates`.
+
+#### 2. Busca de template por nome NÃO é exata
+A Meta API faz **busca por prefixo** em `?name=`. Exemplo: `?name=teste` retorna **tanto `teste` quanto `testes`**. Pegar `data.data[0]` cegamente envia parâmetros do template errado.
+
+**Sempre filtrar localmente:**
+```typescript
+const template = data.data.find(
+  (t: any) => t.name === templateName && (!language || t.language === language)
+);
+if (!template) {
+  console.warn(`[WABA] Template not found exactly: ${templateName}/${language}`);
+  return null;
+}
+```
+
+#### 3. Auto-geração de parâmetros (`fetchTemplateComponents`)
+Ao auto-gerar parâmetros padrão (ex: "Cliente") quando o frontend não passou explicitamente, a função deve:
+
+```typescript
+const isNamed = template.parameter_format === "NAMED";
+const buildParams = (text: string) => {
+  if (isNamed) {
+    const named = Array.from(text.matchAll(/\{\{([a-zA-Z_][\w]*)\}\}/g)).map(m => m[1]);
+    if (named.length === 0) return null;
+    const unique = Array.from(new Set(named));
+    return unique.map(name => ({ type: "text", parameter_name: name, text: "Cliente" }));
+  }
+  const matches = text.match(/\{\{(\d+)\}\}/g);
+  if (!matches) return null;
+  const varCount = Math.max(...matches.map(m => parseInt(m.replace(/\{|\}/g, ""))));
+  return Array.from({ length: varCount }, () => ({ type: "text", text: "Cliente" }));
+};
+```
+
+**Templates com 0 placeholders devem retornar `null`** (não enviar componente body vazio). Se enviar `parameters: []` ou parâmetros sobrando, Meta rejeita com:
+```
+(#132000) Number of parameters does not match the expected number of params
+details: 'body: number of localizable_params (N) does not match the expected number of params (M)'
+```
+
+#### 4. Falhas de template NÃO devem ser silenciosas
+No endpoint `POST /api/tickets/new-conversation` (e similares), NUNCA fazer:
+```typescript
+// ❌ ERRADO: catch silencioso retorna 201 e operador não vê erro
+try {
+  await whatsappService.sendTemplateMessage(...);
+} catch (e) { console.error(e); }
+return res.status(201).json({ ticket });
+```
+
+**Padrão correto:**
+```typescript
+// ✅ Capturar erro do template e devolver no response
+let templateError: string | null = null;
+try {
+  const result = await whatsappService.sendTemplateMessage(...);
+  if (result.success) {
+    await messageRepository.create({ ... });
+  } else {
+    templateError = result.error || "Falha ao enviar template";
+    console.error(`[NewConversation] Template "${templateName}" rejected:`, result.error);
+  }
+} catch (e: any) {
+  templateError = e?.message || "Erro inesperado";
+}
+return res.status(201).json({ ticket, existing: false, templateError });
+```
+
+**Frontend exibe toast destrutivo quando `templateError` está presente:**
+```tsx
+if (result.templateError) {
+  toast({
+    title: "Ticket criado, mas template falhou",
+    description: `Meta rejeitou: ${result.templateError}`,
+    variant: "destructive",
+    duration: 10000,
+  });
+}
+```
+
+#### 5. Códigos de erro comuns no envio de template
+
+| Code | Causa | Ação |
+|---|---|---|
+| `132000` | Número de params não bate | Verificar `parameter_format` e contar `{{...}}` reais |
+| `132001` | Template não existe (ou em rascunho) | Status precisa ser `APPROVED` |
+| `132005` | Texto traduzido é muito longo | Reduzir parâmetros |
+| `132007` | Template pausado por baixa qualidade | Aguardar Meta reativar |
+| `131056` | Pair-rate-limit (mesmo número) | Backoff 30-60s |
+
+#### 6. Validar resposta da Meta — não confiar em `status: 200`
+Mesmo retornando 200, o body pode ter `error`. Sempre checar:
+```typescript
+const data = await res.json();
+if (!res.ok || data.error) {
+  return { success: false, error: data.error?.message || `HTTP ${res.status}` };
+}
+```
+
+#### 7. ❗ Frontend: NUNCA ler o body de uma `Response` duas vezes
+Bug recorrente em `client/src/lib/queryClient.ts` — `throwIfResNotOk`:
+
+```typescript
+// ❌ ERRADO: se .json() falha, .text() lança "body stream already read"
+try {
+  const json = await res.json();
+  errorMessage = json.message || ...;
+} catch {
+  const text = await res.text(); // ← STREAM JÁ CONSUMIDO
+  if (text) errorMessage = text;
+}
+```
+
+Sintoma para o usuário final: toast vermelho `"Erro ao enviar mensagem — Failed to execute 'text' on 'Response': body stream already read"` mascarando o erro real do servidor (ex: janela 24h, validação Zod, 401, etc).
+
+**Padrão correto** — ler como text uma vez e tentar parsear:
+```typescript
+async function throwIfResNotOk(res: Response) {
+  if (!res.ok) {
+    let errorMessage = res.statusText;
+    try {
+      const text = await res.text();
+      if (text) {
+        try {
+          const json = JSON.parse(text);
+          errorMessage = json.message || json.error || text;
+        } catch {
+          errorMessage = text;
+        }
+      }
+    } catch { /* mantém statusText */ }
+    throw new Error(errorMessage);
+  }
+}
+```
+
+Alternativa: `res.clone().json()` antes do primeiro consumo. Mas o padrão acima é mais simples e cobre todos os casos (HTML de erro do nginx, body vazio, JSON malformado, etc).
 
 ## Assistente IA para Templates
 
@@ -1412,18 +1974,75 @@ Padrão profissional de isolamento (como Zendesk/Freshdesk):
 - Botão "Aceitar" em tickets pendentes: sempre visível (sem guarda de `canInteract`)
 - `TICKET_UPDATE` via Socket.io: deseleciona ticket se aceito por outro operador
 
+### Isolamento de Mensagens entre Tickets do Mesmo Contato (CRÍTICO)
+
+**Bug histórico (corrigido 2026-04, Locktec):** `GET /api/tickets/:id/messages` retornava TODAS as mensagens do contato (mesma `contactId`) — quando um operador tinha 2+ tickets abertos em paralelo do mesmo contato (ex: cliente conversando com Comercial e Suporte ao mesmo tempo), as mensagens vazavam entre os tickets.
+
+**Regra correta** (`server/routes.ts` em `GET /api/tickets/:id/messages`):
+```typescript
+// Mensagens do ticket atual + mensagens de tickets FECHADOS do mesmo contato (histórico)
+where: {
+  OR: [
+    { ticketId: ticketId },                              // ticket atual
+    { ticket: { contactId, status: 'closed' } },         // histórico fechado
+  ],
+  tenantId,
+}
+```
+
+NUNCA filtrar apenas por `contactId` sem cláusula de status. O histórico fechado é mostrado para contexto, mas conversas paralelas em andamento ficam isoladas — comportamento esperado em ferramentas profissionais (Zendesk/Intercom).
+
 ## Presença do Operador
 
 ```typescript
 // Auto-online: no login e conexão WebSocket
+// IMPORTANTE: setOnline() PRESERVA status "pause" — se operador está pausado,
+// apenas marca isOnline=true sem alterar status/pausedAt/currentPauseReasonId.
+// O broadcast WebSocket envia status correto ("pause" ou "online").
 userRepository.setOnline(userId);
 
 // Auto-offline: no logout e desconexão WebSocket
+// IMPORTANTE: setOffline() PRESERVA status "pause" — se operador está pausado,
+// apenas marca isOnline=false sem alterar status para "offline".
 userRepository.setOffline(userId);
 
 // Status manual: online, offline, pause
 PATCH /api/users/:id/presence
 Body: { status: "online" | "offline" | "pause" }
+// Quando status="pause", requer pauseReasonId no body
+```
+
+### Sistema de Pausa do Operador
+
+O sistema de pausa é um controle profissional que impede operadores pausados de receberem novos tickets:
+
+**Tabelas Prisma:**
+- `PauseReasons` — Motivos de pausa configuráveis (nome, ícone, cor, ativo, ordem)
+- `UserPauseHistory` — Histórico completo (userId, pauseReasonId, startedAt, endedAt, duration)
+- `Users.status` — "online" | "offline" | "pause"
+- `Users.pausedAt` — timestamp do início da pausa
+- `Users.currentPauseReasonId` — FK para PauseReasons
+
+**Bloqueio em 3 camadas:**
+1. **Distribuição automática** (`webhook.service.ts`): Antes de atribuir ticket, verifica `assignedUser.status !== "pause"`. Se pausado, ticket fica `pending` com `userId=null`.
+2. **Aceite manual** (`PATCH /api/tickets/:id`): Quando operador tenta aceitar ticket pending, verifica status. Se pausado → 403 "Você está em pausa. Retome o atendimento para aceitar novos tickets."
+3. **Persistência de pausa** (`user.repository.ts`): `setOnline()`/`setOffline()` verificam status antes de atualizar. Se "pause", apenas mudam `isOnline` sem resetar pausa. Reconexão WebSocket, refresh de página e login NÃO removem a pausa.
+
+**Frontend (sidebar):**
+- Botão de pausa no sidebar com dialog de seleção de motivo
+- Timer em tempo real mostrando duração da pausa
+- Badge visual de status (online/offline/pausa) no sidebar
+- Toast de erro quando operador pausado tenta aceitar ticket
+
+**Endpoints:**
+```
+GET    /api/pause-reasons                — Lista motivos ativos
+POST   /api/pause-reasons                — Cria motivo (admin)
+PUT    /api/pause-reasons/:id            — Edita motivo
+DELETE /api/pause-reasons/:id            — Remove motivo
+PATCH  /api/users/:id/presence           — Altera status (online/offline/pause)
+GET    /api/users/pause-history          — Histórico de pausas com filtros
+GET    /api/users/operators              — Operadores com stats (inclui pausa)
 ```
 
 ## Padrões de UI das Páginas
@@ -2076,6 +2695,187 @@ Pipeline completo serializado por ticket via `messageProcessingQueue.enqueue(tic
 const normalize = (s: string) => s.trim().toLowerCase().replace(/\s+/g, "_");
 // Match: normalize(tag_intent) === normalize(route.intentName)
 ```
+
+---
+
+## Sistema de Campanhas WhatsApp
+
+Sistema completo de disparo em massa de templates WhatsApp com dashboard de acompanhamento em tempo real.
+
+### Arquitetura
+
+| Arquivo | Responsabilidade |
+|---------|-----------------|
+| `server/services/campaign.service.ts` | Envio de campanhas: processamento de contatos, disparo de templates, controle de ritmo |
+| `server/routes.ts` | Rotas REST de campanhas (CRUD, start, pause, resume, cancel, contacts, export) |
+| `client/src/pages/campanhas.tsx` | Lista de campanhas + Dashboard de acompanhamento |
+| `prisma/schema.prisma` | Modelos `Campaigns` e `CampaignContacts` |
+
+### Modelo de Dados
+
+#### Campaigns
+| Campo | Tipo | Descrição |
+|-------|------|-----------|
+| `id` | Serial PK | ID auto-incremento |
+| `name` | String | Nome da campanha |
+| `status` | String | `pending`, `scheduled`, `sending`, `paused`, `completed`, `cancelled` |
+| `templateName` | String | Nome do template aprovado |
+| `templateLanguage` | String | Idioma do template |
+| `templateCategory` | String | Categoria do template |
+| `templateComponents` | Json | Componentes do template (header, body, buttons) |
+| `whatsappId` | Int | FK → Whatsapps (canal de envio) |
+| `tenantId` | Int | FK → Tenants |
+| `totalContacts` | Int | Total de contatos na campanha |
+| `sentCount` | Int | Contatos enviados com sucesso |
+| `failedCount` | Int | Contatos com falha |
+| `start` | DateTime (NOT NULL) | Data/hora de início (agendamento ou execução) |
+| `completedAt` | DateTime? | Data/hora de conclusão |
+| `responseRouting` | Json? | Roteamento de respostas: `{type, queueId, aiAgentId, windowHours, autoTagId}` |
+
+#### CampaignContacts
+| Campo | Tipo | Descrição |
+|-------|------|-----------|
+| `id` | Serial PK | ID auto-incremento |
+| `campaignId` | Int | FK → Campaigns |
+| `contactId` | Int? | FK → Contacts (opcional) |
+| `messageRandom` | String | Identificador único do envio |
+| `messageId` | String? | Message ID retornado pela Meta (wamid) |
+| `status` | String | `pending`, `sent`, `delivered`, `read`, `replied`, `failed` |
+| `errorReason` | String? | Mensagem de erro se falhou |
+| `variables` | Json? | Variáveis personalizadas do template |
+| `ack` | Int | Acknowledgement level |
+
+### Status Machine
+
+```
+pending/scheduled → Iniciar → sending
+sending → Pausar → paused
+sending → Cancelar → cancelled
+sending → (todos enviados) → completed
+paused → Retomar → sending
+paused → Cancelar → cancelled
+```
+
+### Ações por Status
+
+| Status | Ações Disponíveis |
+|--------|-------------------|
+| `pending` / `scheduled` | Iniciar, Editar, Duplicar |
+| `sending` | Pausar, Cancelar |
+| `paused` | Retomar, Cancelar |
+| `completed` / `cancelled` | Duplicar, Exportar |
+
+### Endpoints API
+
+| Método | Rota | Descrição |
+|--------|------|-----------|
+| GET | `/api/campaigns` | Lista campanhas do tenant |
+| GET | `/api/campaigns/:id` | Detalhes da campanha |
+| POST | `/api/campaigns` | Cria campanha |
+| PATCH | `/api/campaigns/:id` | Atualiza campanha (usa `$queryRawUnsafe` para UPDATE) |
+| DELETE | `/api/campaigns/:id` | Remove campanha |
+| POST | `/api/campaigns/:id/start` | Inicia disparo |
+| POST | `/api/campaigns/:id/pause` | Pausa disparo |
+| POST | `/api/campaigns/:id/resume` | Retoma disparo |
+| POST | `/api/campaigns/:id/cancel` | Cancela disparo |
+| GET | `/api/campaigns/:id/contacts` | Lista contatos paginados |
+| POST | `/api/campaigns/:id/contacts` | Adiciona contatos (array JSON) |
+| GET | `/api/campaigns/:id/export` | Exporta relatório CSV |
+
+**IMPORTANTE — Route ordering:** Rotas específicas (`/start`, `/pause`, `/resume`, `/cancel`, `/contacts`, `/export`) devem ser registradas ANTES da rota genérica `/:id` para evitar que Express interprete "start" como um ID.
+
+### Dashboard (campanhas.tsx)
+
+- **Lista**: Cards com nome, status, progresso, botões de ação
+- **Dashboard**: Navegação automática ao clicar "Iniciar", barra de progresso, lista de contatos paginada
+- **WebSocket**: Evento `CAMPAIGN_PROGRESS` para progresso em tempo real durante envio. liveProgress é limpo 2s após campanha completar para não sobrescrever dados da API
+- **Polling automático**: A tela atualiza automaticamente em TODOS os estados:
+  - `sending`: 3s (detail) / 5s (contacts)
+  - `scheduled`: 10s (detecta auto-start pelo scheduler)
+  - `completed`/`cancelled`/`paused`: 15s (captura delivered/read/replied updates)
+- **Contadores calculados em tempo real**: Os cards (Enviados, Entregues, Lidos) são calculados via `groupBy` nos status reais dos `CampaignContacts` (não via incrementos acumulados no campo da campanha). Lógica cumulativa:
+  - `sentCount` = sent + delivered + read + replied
+  - `deliveredCount` = delivered + read + replied
+  - `readCount` = read + replied
+  - `repliedCount` = replied apenas
+  - `failedCount` = failed apenas
+- **Status dos contatos**: `pending` → `sent` → `delivered` → `read` → `replied` (ou `failed`). Cada status tem badge colorido no dashboard
+- **Filtro de contatos**: Dropdown com Pendentes, Enviados, Entregues, Lidos, Respondidos, Falharam
+- **Aviso de horário comercial**: Quando campanha tem `respectBusinessHours=true` e está fora do horário, mostra card amarelo "Aguardando horário comercial"
+- **Campanha agendada**: Botão "Antecipar Envio" (amber) com confirmação, card informativo azul com horário programado
+- **Campos de tempo em segundos**: Os campos de throttle (pausa entre lotes, delay min/max) são exibidos em segundos na UI mas armazenados em milissegundos no backend
+
+### Seleção de Canal (getConnection)
+
+O `getConnection()` em `campaign.service.ts` seleciona o canal de envio na seguinte ordem de prioridade:
+1. `channelRotation` (round-robin entre múltiplos canais)
+2. `campaign.sessionId` (canal específico selecionado)
+3. Canal com `isDefault: true` do tenant
+4. **Fallback**: qualquer canal WABA conectado do tenant (`type: "waba", status: "CONNECTED"`)
+
+### Rastreamento de Respostas (webhook)
+
+Quando um contato responde a uma mensagem de campanha:
+1. O webhook busca `CampaignContacts` com status `sent/delivered/read` do mesmo contato, dentro da `windowHours` (48h default)
+2. Atualiza o status do contato para `replied` e incrementa `repliedCount`
+3. Se `responseRouting` está configurado, aplica roteamento (fila/agente IA) e auto-tag
+4. O rastreamento funciona independente de `responseRouting` estar configurado
+
+### Status updates da Meta (webhook)
+
+Quando a Meta envia status updates (`delivered`, `read`):
+- Busca `CampaignContacts` pelo `messageId` com status anterior válido
+- `delivered`: aceita contatos com status `sent`
+- `read`: aceita contatos com status `sent`, `delivered` ou `replied` (caso resposta chegue antes do read)
+- Se contato já tem status `replied`, o `readCount` é incrementado mas o status permanece `replied` (não rebaixa)
+
+### IMPORTANTE — queryClient e IDs no path
+
+O `queryClient` padrão do VoxZap trata `queryKey[1]` como **query params object** (não path segment). Para rotas com ID no path (`/api/campaigns/123`), SEMPRE usar `queryFn` explícita:
+
+```typescript
+useQuery({
+  queryKey: ["/api/campaigns", campaignId],
+  queryFn: () => fetch(`/api/campaigns/${campaignId}`).then(r => r.json()),
+});
+```
+
+**NÃO usar** apenas `queryKey: ["/api/campaigns", campaignId]` sem `queryFn` — o fetcher padrão construirá a URL como `/api/campaigns?0=1&1=2&...` (errado).
+
+### Rate Limit & Resiliência (Arquitetura em 3 Camadas)
+
+Implementado em produção (Locktec, 2026-04) após operadores baterem em `429` por compartilharem IP NAT corporativo.
+
+**Camadas:**
+1. **Nginx (anti-DDoS de borda)** — `api_limit 500 r/s burst=1000` por IP. Rate em `/opt/tenants/nginx/conf.d/00-rate-limit.conf`, burst no `tenant_<id>.conf`. Login fica em `5 r/m burst=3`.
+2. **Express por usuário** — `server/middleware/rate-limit.ts`, 60 req/s por `userId` (responde `429` com header `Retry-After`). Plugado dentro de `authenticateToken` e respeita `X-Tenant-Id` (override de superadmin). Skip em `/api/health`, `/api/login`, `/api/auth`, `/api/webhook`, `/api/socket.io`.
+3. **Express por tenant** — mesmo middleware, 1000 req/s por `tenantId`. In-memory `Map`, fail-open (se o middleware quebra, libera).
+
+**Frontend (`client/src/lib/queryClient.ts`):**
+- `fetchWithRetry` respeita `Retry-After` e faz até 2 retries com jitter — **APENAS para GET/HEAD** (mutations seguem sem retry para preservar idempotência).
+- Em `429` ou resposta HTML do nginx, mensagem humanizada em PT-BR (nada de HTML cru no toast).
+
+**Frontend (`client/src/hooks/use-socket.ts`):**
+- `scheduleInvalidatePrefix(prefix, 250ms)` e `scheduleInvalidateTicketMessages(ticketId, 200ms)` coalescem rajadas de `invalidateQueries` disparadas pelos handlers (`handleNewMessage`, `handleTicketUpdate`, `handleNewTicket`, `handleTicketTransfer`, `handleTicketMessage`).
+- NUNCA chamar `queryClient.invalidateQueries({ predicate: key.startsWith('/api/tickets') })` direto dentro de handler de socket — usar os helpers, senão ressurge o problema de N refetchs por segundo.
+
+**Variáveis de ambiente** (defaults em `rate-limit.ts`):
+```
+USER_RATE_LIMIT=60        USER_RATE_WINDOW_MS=1000
+TENANT_RATE_LIMIT=1000    TENANT_RATE_WINDOW_MS=1000
+```
+
+### PATCH com $queryRawUnsafe
+
+O campo `start` (DateTime NOT NULL) causa conflitos com Prisma `.update()`. O PATCH da campanha usa `$queryRawUnsafe` com SQL direto:
+
+```typescript
+await prisma.$queryRawUnsafe(`UPDATE "Campaigns" SET ... WHERE id = $1`, id);
+```
+
+### Contatos em Modo Edição
+
+Contatos são **read-only** em modo edição. O upload de contatos só é permitido na criação da campanha. Na edição, os contatos existentes são exibidos mas não podem ser modificados.
 
 ---
 

@@ -34,6 +34,7 @@ scripts/clients/
   register.mjs    # cria/atualiza cliente (interativo + flags)
   list.mjs        # lista todos ou um cliente (senhas mascaradas)
   ssh.mjs         # executa comando via SSH e devolve JSON {stdout, stderr, exitCode}
+  upload.mjs      # SFTP-upload de arquivo grande (>>10KB) — USAR EM VEZ de base64 inline
   log.mjs         # adiciona acao ao historico (le JSON do stdin)
   search.mjs      # busca top-K acoes similares no historico
 
@@ -71,6 +72,96 @@ scripts/clients/
    ```
 
 Sempre logar quando: (a) descobrir algo novo, (b) executar mudança, (c) o usuário relatar/resolver problema.
+
+## Transferindo arquivos para a VPS (regra CRÍTICA)
+
+**Decisão rápida** — qual abordagem usar para mover um arquivo do Replit pra VPS?
+
+| Tamanho do arquivo | Ferramenta | Por quê |
+|---|---|---|
+| `≤ 8 KB` (~snippet, config curto) | `ssh.mjs` com heredoc ou base64 inline | Cabe no `argv` |
+| `> 8 KB` (qualquer fonte TS/JS/JSON real) | **`upload.mjs` (SFTP)** | `argv` estoura ("Argument list too long") |
+
+### ✅ Forma correta para arquivos grandes
+
+```bash
+node scripts/clients/upload.mjs <slug> <localPath> <remotePath>
+# ex:
+node scripts/clients/upload.mjs voxzap-voxtel \
+  server/services/uazapi.service.ts \
+  /opt/tenants/voxzap-voxtel/source/server/services/uazapi.service.ts
+# saída: {"ok":true,"bytes":14518,"remotePath":"..."}
+```
+
+`upload.mjs` usa o canal SFTP do `ssh2` (que reusa a mesma autenticação do cofre AES-256-GCM), sem prompt de senha, sem limite de argv.
+
+### ❌ Anti-padrões (NÃO repetir)
+
+```bash
+# ❌ scp direto — pede senha interativa, quebra os scripts não-tty
+scp -P 22300 file root@host:/path           # → "password:" prompt → travamento
+
+# ❌ base64 inline em arg — estoura para arquivos > ~8 KB
+B64=$(base64 -w 0 file_grande.ts)
+node scripts/clients/ssh.mjs slug "echo '$B64' | base64 -d > /path"
+# → "Argument list too long" (exit code 126)
+
+# ❌ heredoc via ssh.mjs — escape de aspas/dolar fica intratável
+node scripts/clients/ssh.mjs slug "cat > /path <<'EOF'
+... conteúdo com aspas e $vars ...
+EOF"
+# → frágil, qualquer aspa no source vira shell injection
+```
+
+### Limites operacionais
+
+- `ssh.mjs` tem `SSH_TIMEOUT_MS=60000` por padrão. Para builds Docker (>2 min), aumente:
+  `SSH_TIMEOUT_MS=180000 node scripts/clients/ssh.mjs slug 'docker compose up -d --build app'`
+- Mesmo se o `SSH_TIMEOUT_MS` estourar, o comando **continua rodando na VPS**. Pra confirmar, faça uma segunda chamada `ssh.mjs slug "docker ps"`.
+
+### Executar SQL multi-statement em Postgres dockerizado
+
+**Padrão obrigatório** quando precisar rodar uma análise SQL com `\echo`, múltiplas queries, CTEs longas ou backslash-commands (`\x`, `\pset`, `\d`) num Postgres em container (ex: `voxzap-locktec-db`, `voxzap-voxtel-db`):
+
+```bash
+# 1) Escreva o SQL local em .local/tmp/<nome>.sql
+# 2) Upload via SFTP
+node scripts/clients/upload.mjs <slug> .local/tmp/forensic.sql /tmp/forensic.sql
+
+# 3) docker cp + psql -f (saída direto pro stdout do ssh.mjs)
+node scripts/clients/ssh.mjs <slug> 'docker cp /tmp/forensic.sql <slug>-db:/tmp/q.sql \
+  && docker exec <slug>-db psql -U <user> -d <db> -f /tmp/q.sql 2>&1'
+```
+
+**Por que NÃO usar heredoc inline**: heredocs com `\echo`, aspas duplas escapadas e `\\"colName\\"` passados pelo `argv` do `ssh.mjs` frequentemente chegam vazios no `docker exec -- psql` — vimos casos onde a query rodou (`exitCode=0`, `durationMs ~2s`) mas o `stdout` veio vazio porque o pipe stdin se perdeu na cadeia ssh→docker→psql. Anti-padrão real:
+
+```bash
+# ❌ Heredoc multi-statement com \echo — falha silenciosa frequente
+node scripts/clients/ssh.mjs slug "docker exec slug-db psql -U user -d db <<'SQL'
+\echo === BLOCO 1 ===
+SELECT ...
+SQL"
+# → exitCode=0, stdout vazio, sem erro
+```
+
+**Se a saída ficar truncada pelo wrapper JSON do ssh.mjs** (queries que devolvem >100 linhas):
+
+```bash
+# Salva no servidor, baixa só a parte relevante
+node scripts/clients/ssh.mjs slug 'docker exec slug-db psql -U user -d db -f /tmp/q.sql > /tmp/out.txt 2>&1; wc -l /tmp/out.txt'
+node scripts/clients/ssh.mjs slug 'cat /tmp/out.txt' > .local/tmp/out.json
+node -e "console.log(require('./.local/tmp/out.json').stdout)" | head -200
+```
+
+**Backup ANTES de qualquer DELETE/UPDATE em produção**: convenção é salvar em `/opt/tenants/<slug>/backups/<tabela>-pre-<motivo>-<YYYYMMDD>.sql`:
+
+```bash
+node scripts/clients/ssh.mjs <slug> 'mkdir -p /opt/tenants/<slug>/backups && \
+  docker exec <slug>-db pg_dump -U <user> -d <db> -t '"'"'"<Tabela>"'"'"' \
+  --data-only --column-inserts > /opt/tenants/<slug>/backups/<tabela>-pre-<motivo>-$(date +%Y%m%d).sql'
+```
+
+**Convenção de nomes nos containers VoxZap multi-tenant**: `<slug>-app` (Node) e `<slug>-db` (Postgres). Credenciais default herdadas do template: usuário `voxzap`, banco `voxzap`. Tabelas em camelCase com aspas duplas obrigatórias (`"Tickets"`, `"UserWhatsapps"`); colunas datetime tipo `bigint` em ms (use `to_timestamp(col/1000) AT TIME ZONE 'America/Sao_Paulo'` para legibilidade).
 
 ## Cadastrar novo cliente
 
