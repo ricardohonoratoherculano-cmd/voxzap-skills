@@ -315,14 +315,20 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { findManualEntry } from "@/lib/manual-data";
 import PageHelpDialog from "@/components/page-help-dialog";
 
-export default function PageHelpButton() {
+interface PageHelpButtonProps {
+  manualHref?: string;
+}
+
+export default function PageHelpButton({ manualHref }: PageHelpButtonProps = {}) {
   const [pathname] = useLocation();
   const [open, setOpen] = useState(false);
 
+  const lookupPath = manualHref ?? pathname;
+
   const entry = useMemo(() => {
-    if (pathname === "/manual") return null;
-    return findManualEntry(pathname);
-  }, [pathname]);
+    if (lookupPath === "/manual") return null;
+    return findManualEntry(lookupPath);
+  }, [lookupPath]);
 
   const hasEntry = !!entry;
 
@@ -377,13 +383,23 @@ export default function PageHelpButton() {
       <PageHelpDialog
         open={open}
         onOpenChange={setOpen}
-        pathname={pathname}
+        pathname={lookupPath}
         item={entry.item}
       />
     </>
   );
 }
 ```
+
+#### Prop `manualHref` — quando usar
+
+A prop opcional `manualHref` permite renderizar o botão em layouts que **não usam o sistema de rotas** (ex: painéis isolados, dashboards de operador montados fora do `<Switch>` do wouter). Ao passar `manualHref="/algum-id"`, o componente ignora o pathname real e busca a entry no manual usando esse identificador.
+
+**Caso de uso real (VoxCALL — Painel do Operador)**:
+- O `AgentPanel` é renderizado fora do AdminLayout quando `mode === "agent"`, então o pathname do wouter fica `/`
+- Existe entry `/` no manual ("Página Início") que não faz sentido para o operador
+- Solução: criar entry `/agent-panel` no `manual-data.tsx` e renderizar `<PageHelpButton manualHref="/agent-panel" />` no header interno do painel
+- Resultado: o operador clica/aperta `?` e vê ajuda específica do painel dele, mesmo sem haver rota wouter `/agent-panel`
 
 **ATENÇÃO — anti-patterns que o code review pegou e foram corrigidos**:
 - `useEffect` deve depender de `[hasEntry]` (boolean estável), **NUNCA** de `[entry]` (objeto). Se a TopBar tiver um clock que renderiza a cada segundo, depender de `entry` recria o listener 1×/segundo (memory churn invisível).
