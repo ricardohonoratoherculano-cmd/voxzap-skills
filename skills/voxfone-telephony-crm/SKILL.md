@@ -571,7 +571,10 @@ All UI labels in Portuguese (pt-BR). Maintain this convention for any new featur
 5. **Frontend page** — Create in `client/src/pages/`, register in `App.tsx`
 6. **Sidebar entry** — Add to `Sidebar.tsx` with permission check
 7. **Permission** — Add new permission string to admin user's permissions array
-8. **Test** — Verify auth works (header + cookie), test with real data
+8. **Menu permissions** — Add the new route to the corresponding section in `allMenuItems` of `client/src/pages/menu-permissions.tsx` so SuperAdmin can grant/revoke it per role
+9. **Manual** — Add a `ManualItem` (with `href` pointing to the new route) inside the matching `ManualSection` in `client/src/pages/manual.tsx`. Always include `href` so the "Abrir" button appears and respects role permissions
+10. **Sync check** — Run `node scripts/check-manual-sync.mjs` to verify the Manual coverage is at 100% (script lists routes present in `App.tsx` but missing from `manual.tsx` and broken hrefs in the Manual)
+11. **Test** — Verify auth works (header + cookie), test with real data
 
 ## Dashboard — Ações no Ramal (ARI Actions Modal)
 
@@ -2247,3 +2250,23 @@ VoxGuard is deployed automatically during Asterisk build:
 12. **No hot-reload**: Config loaded once at startup. After changes (log sources, whitelist, thresholds), `systemctl restart voxguard` required
 13. **PostgreSQL multi-container monitoring**: Uses Python `selectors` module for non-blocking reads across multiple `docker logs -f` processes — avoids stalling when one container is quiet
 14. **Nginx patterns match request path**: Scan detection regex matches suspicious tokens in the URL path (before status code), not after — handles standard access log format correctly
+
+## Sistema de Ajuda Contextual (Sheet lateral) — IMPLEMENTADO
+
+O VoxCALL/PlanoClin já possui sistema completo de ajuda contextual por página: botão `? Ajuda` na TopBar, atalho global `?`, painel lateral à direita (Sheet shadcn ~480px), conteúdo direto da página atual sem sair dela. Padrão visual igual a Stripe/Linear/Vercel/Notion.
+
+**Arquivos**:
+- `client/src/lib/manual-data.tsx` (687 linhas) — tipos, sections, `findManualEntry`, `highlightStyle`, `highlightIcon`
+- `client/src/components/page-help-button.tsx` (75 linhas) — botão na TopBar + listener `?`
+- `client/src/components/page-help-dialog.tsx` (140 linhas) — Sheet lateral
+- `client/src/components/top-bar.tsx` — renderiza `<PageHelpButton />`
+- `client/src/pages/manual.tsx` (303 linhas) — re-importa de `@/lib/manual-data`
+
+**Regras críticas a respeitar ao mexer**:
+1. **Nunca** importar de `@/pages/manual` em `page-help-button.tsx` ou `page-help-dialog.tsx` — sempre de `@/lib/manual-data`. Importar a página inteira na TopBar pesa o bundle global.
+2. `useEffect` do listener depende de `[hasEntry]` (boolean), **nunca** `[entry]` (objeto) — TopBar renderiza a cada 1s pelo clock.
+3. `findManualEntry` faz match **exato** (`pathname === item.href`), não `startsWith`.
+4. Botão "Abrir manual completo" usa `<Button asChild><Link>...</Link></Button>` (HTML válido).
+5. Listener bloqueia em INPUT/TEXTAREA/SELECT, contentEditable, e roles `textbox/combobox/searchbox`.
+
+Para replicar este sistema em outro projeto (VoxZap, VoxHub, etc.), consulte a skill dedicada `contextual-help-system`.
