@@ -2257,9 +2257,10 @@ O VoxCALL/PlanoClin já possui sistema completo de ajuda contextual por página:
 
 **Arquivos**:
 - `client/src/lib/manual-data.tsx` (687 linhas) — tipos, sections, `findManualEntry`, `highlightStyle`, `highlightIcon`
-- `client/src/components/page-help-button.tsx` (75 linhas) — botão na TopBar + listener `?`
+- `client/src/components/page-help-button.tsx` (~85 linhas) — botão na TopBar + listener `?`. Aceita prop opcional `manualHref?: string` para sobrescrever o pathname na busca.
 - `client/src/components/page-help-dialog.tsx` (140 linhas) — Sheet lateral
-- `client/src/components/top-bar.tsx` — renderiza `<PageHelpButton />`
+- `client/src/components/top-bar.tsx` — renderiza `<PageHelpButton />` (sem props, usa pathname real do wouter)
+- `client/src/pages/agent-panel.tsx` (linha 1646, header interno do operador) — renderiza `<PageHelpButton manualHref="/agent-panel" />` agrupado com `<LiveClock />`. Necessário porque o AgentPanel fica fora do AdminLayout (`mode==="agent"` em App.tsx) e o pathname wouter seria `/`, casando com a entry "Página Início" — incorreta para o operador.
 - `client/src/pages/manual.tsx` (303 linhas) — re-importa de `@/lib/manual-data`
 
 **Regras críticas a respeitar ao mexer**:
@@ -2268,5 +2269,7 @@ O VoxCALL/PlanoClin já possui sistema completo de ajuda contextual por página:
 3. `findManualEntry` faz match **exato** (`pathname === item.href`), não `startsWith`.
 4. Botão "Abrir manual completo" usa `<Button asChild><Link>...</Link></Button>` (HTML válido).
 5. Listener bloqueia em INPUT/TEXTAREA/SELECT, contentEditable, e roles `textbox/combobox/searchbox`.
+6. **Layouts fora do AdminLayout** (ex: AgentPanel quando `mode==="agent"`) devem usar `<PageHelpButton manualHref="/algo" />` com uma entry correspondente em `manual-data.tsx`. Sem isso, o pathname `/` casaria com "Página Início" (errado para o operador) ou com nada (botão some).
+7. Quando criar nova entry para um layout assim, use um `href` que **NÃO** colida com nenhuma rota real do `App.tsx` (ex: `/agent-panel` é seguro porque o painel é renderizado fora do `<Switch>` do wouter).
 
-Para replicar este sistema em outro projeto (VoxZap, VoxHub, etc.), consulte a skill dedicada `contextual-help-system`.
+Para replicar este sistema em outro projeto (VoxZap, VoxHub, etc.), consulte a skill dedicada `contextual-help-system` — inclui o padrão `manualHref` documentado.

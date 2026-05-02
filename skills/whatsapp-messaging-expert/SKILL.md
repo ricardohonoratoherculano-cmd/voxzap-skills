@@ -2206,11 +2206,12 @@ const reactivateSetting = walletSettings.reactivateBotOnReopen || "enabled";
 
 O VoxCALL/PlanoClin (sistema irmão de PBX/Asterisk) já possui em produção um sistema completo de ajuda contextual por página: botão `? Ajuda` na TopBar, atalho global `?`, painel lateral à direita (Sheet shadcn ~480px), conteúdo direto da página atual sem sair dela. Padrão visual igual a Stripe/Linear/Vercel/Notion/Salesforce/HubSpot.
 
-**Para implementar este mesmo sistema no VoxZap, use a skill dedicada `contextual-help-system`** — ela contém o passo a passo completo, snippets prontos dos 3 componentes (`page-help-button.tsx`, `page-help-dialog.tsx`, `manual-data.tsx`), pré-checks obrigatórios, e a lista de anti-patterns que o code review pegou no VoxCALL e foram corrigidos.
+**Para implementar este mesmo sistema no VoxZap, use a skill dedicada `contextual-help-system`** — ela contém o passo a passo completo, snippets prontos dos 3 componentes (`page-help-button.tsx`, `page-help-dialog.tsx`, `manual-data.tsx`), pré-checks obrigatórios, a lista de anti-patterns que o code review pegou no VoxCALL e foram corrigidos, e o padrão `manualHref` para layouts isolados.
 
 **Adaptações esperadas para o VoxZap (multi-tenant)**:
 - TopBar/Header global: confirmar com `grep -rn "useChatContext\|MessageCircle\|TopBar\|Header" client/src/components/`
 - Rotas a mapear no `manual-data.tsx`: `/atendimento`, `/dashboard`, `/operator-dashboard`, `/channels`, `/templates`, `/users`, `/queues`, `/contacts`, `/ai-knowledge`, `/configuracoes`, `/reports`
+- **Painel do Operador (`/operator-dashboard`)**: se for renderizado fora do AdminLayout (como o AgentPanel do VoxCALL), use `<PageHelpButton manualHref="/operator-dashboard" />` no header interno e crie uma entry específica em `manual-data.tsx`. Sem isso, o operador veria a ajuda da rota errada ou nenhuma ajuda. O VoxCALL resolveu exatamente esse caso em produção e o padrão está documentado na skill `contextual-help-system`.
 - **Não** colocar dados específicos de tenant (números, nomes de empresa) no `manual-data.tsx` — só descrições funcionais genéricas que servem para qualquer cliente
 - Se não houver página `/manual`, simplificar o footer do Sheet removendo o botão "Abrir manual completo" (manter só "Fechar")
 - Verificar se o shadcn Sheet já está instalado: `ls client/src/components/ui/sheet.tsx` (se faltar, `npx shadcn-ui@latest add sheet tooltip button scroll-area separator`)
