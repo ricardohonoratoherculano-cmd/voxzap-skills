@@ -266,18 +266,22 @@ Salvar em `.local/build/<tenant>.credentials` com chmod 600.
 #### 2. Empacotar source (na máquina local/Replit)
 ```bash
 # IMPORTANTE: incluir script/ (singular). Excluir o que não é source.
+# Tambem excluir .agents/ (skills do agente, nao pertencem ao build do tenant).
+# NAO listar 'public/' aqui — essa pasta NAO existe no projeto VoxZap atual
+# (tar falha com exit code 2 e o tarball mesmo assim eh gerado, mas evite).
 tar --exclude='node_modules' --exclude='.git' --exclude='dist' \
     --exclude='attached_assets' --exclude='.local' --exclude='*.log' \
-    --exclude='screenshots' --exclude='.cache' \
+    --exclude='screenshots' --exclude='.cache' --exclude='.agents' \
     -czf .local/build/voxzap-source.tar.gz \
     package.json package-lock.json tsconfig.json vite.config.ts \
     drizzle.config.ts components.json tailwind.config.ts postcss.config.js \
-    prisma/ server/ client/ shared/ script/ public/ uploads/.gitkeep
+    prisma/ server/ client/ shared/ script/ uploads/.gitkeep
 
 # Validar
 tar tzf .local/build/voxzap-source.tar.gz | grep -cE '^(prisma|server|client|script)/'
-# deve ser > 4
+# deve ser > 4 (em deploys recentes — 290 entradas dessas pastas)
 md5sum .local/build/voxzap-source.tar.gz
+ls -lh .local/build/voxzap-source.tar.gz   # tipico: ~1.1MB compactado
 ```
 
 #### 3. Upload via SFTP (NUNCA scp + heredoc)
@@ -508,9 +512,18 @@ mkdir source
 tar xzf /tmp/<tenant>-source.tar.gz -C source
 
 # 4. Build
+# ATENCAO ao timeout: docker build leva ~40-60s. Se rodar via scripts/clients/ssh.mjs,
+# o default SSH_TIMEOUT_MS=60000 pode estourar. Sempre usar:
+#   SSH_TIMEOUT_MS=180000 node scripts/clients/ssh.mjs <slug> '... docker compose build app ...'
+# Se o bash local cair com exit -1 (timeout), o build CONTINUA na VPS — verificar com
+# uma segunda chamada SSH curta consultando `docker images | grep <slug>-app` e
+# `docker compose ps`.
 docker compose build app 2>&1 | tail -20
 
 # 5. Verificar se tem migração de schema pendente
+# PARA DEPLOYS SOMENTE FRONTEND (sem mudancas em prisma/schema.prisma):
+# pode pular este passo OU rodar mesmo assim — em deploys frontend-only o output
+# tipico eh "The database is already in sync with the Prisma schema. Done in 500ms".
 docker compose run --rm app npx prisma migrate status 2>&1 | tail -10
 # OU, se o projeto não usa migrations (só db push):
 docker compose run --rm app npx prisma db push --accept-data-loss --skip-generate
@@ -525,9 +538,37 @@ sleep 10
 curl -sk https://<DOMAIN>/api/health | jq
 docker compose logs app --tail=30 | grep -iE 'error|listening'
 
+# (opcional) confirmar que o source novo realmente esta no container — util quando
+# voce mudou um arquivo especifico e quer ter certeza que entrou no build:
+grep -n '<string-distintiva-da-mudanca>' source/<caminho/do/arquivo>
+
 # 8. Se tudo OK, limpar source antigo
 rm -rf source.OLD
 ```
+
+### Padrão "deploy compacto numa só chamada SSH" (quando a mudança é frontend-only)
+
+Quando você está aplicando hotfix pequeno sem mudanças de schema, dá pra encadear
+trocar-source + build + restart + validar numa única chamada `ssh.mjs` para reduzir
+latência. **Sempre** com `set -e` e `SSH_TIMEOUT_MS=180000`:
+
+```bash
+SSH_TIMEOUT_MS=180000 node scripts/clients/ssh.mjs <slug> '
+  set -e && cd /opt/tenants/<slug> &&
+  rm -rf source.OLD && mv source source.OLD && mkdir source &&
+  tar xzf /tmp/<slug>-source.tar.gz -C source &&
+  echo "=== source trocado ===" &&
+  grep -n "<string-distintiva-da-mudanca>" source/<caminho/do/arquivo> &&
+  docker compose build app 2>&1 | tail -8 && echo "=== build OK ===" &&
+  docker compose up -d --no-deps app && sleep 12 &&
+  docker compose ps app &&
+  curl -sk -o /dev/null -w "Health: HTTP %{http_code}\n" https://<DOMAIN>/api/health &&
+  rm -rf source.OLD
+'
+```
+
+O `grep` da string distintiva entre extract e build é o melhor sanity-check barato
+para garantir que o tarball certo foi enviado.
 
 ### Rollback (se algo quebrar)
 
@@ -538,6 +579,143 @@ mv source source.NEW && mv source.OLD source
 docker compose build app && docker compose up -d --no-deps app
 # Para rollback de schema: pg_restore do backup feito no passo 1
 ```
+
+---
+
+## Hotfix CIRÚRGICO in-place no `dist/index.cjs` (sem rebuild)
+
+Cenário raro mas real: bug pequeno, isolado, em produção; rebuild + deploy + restart é arriscado (downtime, schema drift entre tenants, janela proibida). Se a correção pode ser expressa como **substituição de bytes específicos** no bundle JavaScript já buildado (`/app/dist/index.cjs`), dá pra patcheá-lo in-place dentro do container, sem tocar no source/build/schema. Usado pela primeira vez em 2026-04-30 no voxzap-locktec (Tarefa #166, regex safety-net de transferência).
+
+**Quando usar:**
+- A mudança é estritamente literal (string→string, regex→regex) e cabe em `String.replaceAll`.
+- Source no Replit já tem a versão correta — você só está empurrando a mesma correção que outro tenant já tem em produção.
+- Schema do DB do tenant pode estar **desincronizado** do source (caso clássico: tenant velho com migração ZPro, source atual já evoluiu) — rebuild full quebraria.
+- Janela de não-rebuild explicitamente solicitada pelo cliente.
+
+**Quando NÃO usar:**
+- Mudança envolve nova função, nova rota, nova dependência, nova variável de ambiente → REBUILD.
+- Mudança envolve mais de ~3 substituições literais → maior risco de off-by-one, fazer rebuild.
+- Não há backup confiável do schema atual.
+
+### Procedimento (template)
+
+```bash
+# 1. SNAPSHOT pré-patch (host + container, com timestamp)
+TS=$(date +%Y%m%d_%H%M%S)
+node scripts/clients/ssh.mjs <tenant> "
+  docker exec <tenant>-app md5sum /app/dist/index.cjs
+  mkdir -p /opt/tenants/<tenant>/backups
+  docker cp <tenant>-app:/app/dist/index.cjs /opt/tenants/<tenant>/backups/index.cjs.pre-hotfix-$TS
+  docker exec <tenant>-app cp /app/dist/index.cjs /tmp/index.cjs.pre-hotfix-$TS
+"
+
+# 2. CONSTRUIR + TESTAR localmente o regex/string nova (testes positivos E negativos)
+node .local/tmp/test_new_pattern.mjs   # ALL TESTS PASSED antes de prosseguir
+
+# 3. PATCH SCRIPT em Node (NUNCA sed/awk — escape de caracteres não-ASCII vira inferno).
+#    O script DEVE: contar ocorrências antes (esperado=N), aplicar replaceAll, contar depois
+#    (esperado: N do antigo→0, N do novo após patch), comparar delta de bytes esperado vs real,
+#    abortar com exit≠0 em qualquer divergência ANTES de writeFileSync.
+node scripts/clients/upload.mjs <tenant> .local/tmp/patch.mjs /tmp/patch.mjs
+node scripts/clients/ssh.mjs <tenant> "
+  docker cp /tmp/patch.mjs <tenant>-app:/tmp/patch.mjs
+  docker exec <tenant>-app node /tmp/patch.mjs
+"
+
+# 4. VALIDAR semanticamente: extrair o literal patcheado direto do bundle e rodar os mesmos
+#    testes que rodaram localmente. Pega bugs de encoding/escape que grep não pega.
+node scripts/clients/ssh.mjs <tenant> "docker exec <tenant>-app node /tmp/validate_in_bundle.mjs"
+
+# 5. RESTART (graceful, ≤15s) + checar boot logs
+node scripts/clients/ssh.mjs <tenant> "
+  docker restart <tenant>-app
+  sleep 10
+  docker logs <tenant>-app --since 30s 2>&1 | grep -iE 'error|fatal|exception' | head
+"
+
+# 6. SMOKE: /api/health + baseline SQL read-only do KPI afetado pelo bug (registrar pré e pós)
+curl -sk https://<dominio>/api/health
+docker exec <tenant>-db psql -U voxzap -d voxzap -f baseline.sql
+```
+
+### Rollback (≤60s)
+
+```bash
+node scripts/clients/ssh.mjs <tenant> "
+  docker cp /opt/tenants/<tenant>/backups/index.cjs.pre-hotfix-<TS> <tenant>-app:/app/dist/index.cjs
+  docker restart <tenant>-app
+"
+```
+
+### Verificação pós-rollback (OBRIGATÓRIA)
+
+Rollback sem verificação pode mascarar restore parcial / arquivo errado. SEMPRE rodar este bloco logo após o rollback e SÓ declarar “revertido” se as 3 verificações passarem:
+
+```bash
+node scripts/clients/ssh.mjs <tenant> "
+  echo '=== md5 atual deve bater com o md5 ORIGINAL pré-patch ==='
+  docker exec <tenant>-app md5sum /app/dist/index.cjs
+  md5sum /opt/tenants/<tenant>/backups/index.cjs.pre-hotfix-<TS>
+  echo
+  echo '=== /api/health deve estar healthy + database connected ==='
+  curl -sk -m 5 https://<dominio>/api/health
+  echo
+  echo '=== boot logs últimos 60s sem error/fatal/exception ==='
+  docker logs <tenant>-app --since 60s 2>&1 | grep -iE 'error|fatal|exception' | head -20 || echo '(sem erros)'
+"
+```
+
+Se md5 atual ≠ md5 do backup: rollback falhou (arquivo errado). NÃO declarar revertido — repetir `docker cp` ou investigar.
+
+Se /api/health não retornar `{"status":"healthy",...,"database":"connected"}`: app subiu corrupto. Container provavelmente em loop de restart — `docker logs` para diagnóstico.
+
+Se logs mostrarem stack trace novo: rollback derrubou alguma config/dependência colateral. Avaliar antes de continuar.
+
+### Marcador operacional no host (recomendado)
+
+Ao patchear in-place, deixar um arquivo de aviso no diretório do tenant para operadores que façam manutenção futura sem ler o `replit.md`:
+
+```bash
+node scripts/clients/ssh.mjs <tenant> "
+  cat > /opt/tenants/<tenant>/HOTFIX-IN-PLACE-NOTICE.txt <<EOF
+ATENÇÃO: container <tenant>-app contém HOTFIX IN-PLACE no /app/dist/index.cjs
+Aplicado em: <TS_BRT>
+Tarefa: #<N>
+Causa: <descrição curta>
+md5 pré-patch:  <md5_antes>
+md5 pós-patch:  <md5_depois>
+Backup do bundle pré-patch: /opt/tenants/<tenant>/backups/index.cjs.pre-hotfix-<TS>
+
+⚠️ NÃO rodar 'docker compose build app' ou 'docker compose up --force-recreate'
+   sem antes garantir que o source em /opt/tenants/<tenant>/source/ está
+   sincronizado com a versão do Replit que originou o patch.
+   Caso contrário o build sobrescreve o hotfix e o bug volta.
+
+Documentação completa: replit.md → 'Production Hotfixes Log'
+EOF
+  ls -la /opt/tenants/<tenant>/HOTFIX-IN-PLACE-NOTICE.txt
+"
+```
+
+Esse arquivo é a “senha” pra qualquer pessoa que SSH-e direto na VPS sem passar pelo Replit. Remover só após o próximo deploy sincronizado.
+
+### Regras invioláveis do hotfix in-place
+
+1. **NUNCA** usar `sed` / `awk` / `tr` para o patch — Unicode (ç, á, ê) e backslashes escapados explodem silenciosamente.
+2. **SEMPRE** `String.replaceAll` em Node, com **assertion de count** antes e depois da substituição. Se contou diferente do esperado, abortar **antes** de `writeFileSync`.
+3. **SEMPRE** dois backups: host (`/opt/tenants/<tenant>/backups/`) + container (`/tmp/`). O do container salva você se o host estiver indisponível na hora do rollback.
+4. **SEMPRE** documentar o md5 antes/depois e o delta de bytes esperado, para auditoria.
+5. **SEMPRE** documentar no `replit.md` (seção "Production Hotfixes Log") com data, tenant, causa-raiz, identidade dos literais substituídos, md5 antes/depois, paths dos backups, e plano de rollback. O patch SOBREESCREVE no próximo build/deploy do tenant — quem fizer o próximo deploy precisa saber que o source TEM que estar sincronizado.
+6. **NÃO** rodar testes e2e que possam gerar tickets reais / mensagens reais. Validação é via teste sintético do regex/string carregado do próprio bundle (passo 4) + monitoramento passivo do KPI afetado (passo 6+).
+
+### Caso de referência: Tarefa #166
+
+- Tenant: `voxzap-locktec` (eveo1, slot 2)
+- Bundle: `/app/dist/index.cjs` (3.064.601 → 3.065.891 bytes, +1.277)
+- md5: `19ab35e60adf4d764d6cb3c5c987fa65` → `df99dfddc70ad50242aa11193f1bed6b`
+- Substituídos: 2 regex literais permissivas (offsets 1.772.236 e 1.774.228) por uma única regex estrita (851 chars de source) compilada do `server/services/ai-agent.service.ts:35-68`.
+- Tempo total: ~10 min (snapshot + patch + validação + restart + smoke).
+- Ver `replit.md` → "Production Hotfixes Log" para detalhes completos.
 
 ---
 
